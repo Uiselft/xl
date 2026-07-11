@@ -9,6 +9,7 @@
     "node": ">=18"
   },
   "dependencies": {
+    "@roamhq/wrtc": "^0.10.0",
     "livekit-client": "^2.20.1",
     "livekit-server-sdk": "^2.9.0",
     "ws": "^8.18.0"
