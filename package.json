@@ -8,6 +8,7 @@
     "node": ">=18"
   },
   "dependencies": {
-    "ws": "^8.18.0"
+    "ws": "^8.18.0",
+    "livekit-server-sdk": "^2.9.0"
   }
 }
