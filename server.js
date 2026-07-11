@@ -151,6 +151,11 @@ async function connectSignal() {
       var sig = proto.SignalResponse.fromBinary(new Uint8Array(buf));
       var msgCase = sig.message && sig.message.case;
 
+      // Debug: логируем все входящие типы кроме шума
+      if (msgCase && msgCase !== 'pong' && msgCase !== 'speakersChanged' && msgCase !== 'roomUpdate') {
+        console.log('[signal] msg.case=' + msgCase);
+      }
+
       if (msgCase === 'join') {
         agentConnected = true;
         var join = sig.message.value;
@@ -169,17 +174,36 @@ async function connectSignal() {
         }, 10000);
       }
 
-      if (msgCase === 'dataChannelMessage') {
-        // DataPacket от другого участника (reliable через SCTP signaling)
-        var dc  = sig.message.value;
-        var raw = dc.payload || dc.data;
-        if (!raw) return;
-        var fromId = dc.participantSid || dc.participantIdentity || 'unknown';
+      // publishData({reliable:true}) приходит как userPacket в SignalResponse
+      if (msgCase === 'userPacket') {
+        var up = sig.message.value;
+        // up это DataPacket — содержит .user (UserPacket) и .participantIdentity
+        var fromId   = up.participantIdentity || up.participantSid || 'unknown';
+        var userPkt  = up.value && up.value.case === 'user' ? up.value.value : up.user;
+        var raw      = userPkt && (userPkt.payload || userPkt.data);
+        if (!raw) {
+          console.log('[data] userPacket без payload, keys=' + Object.keys(up).join(','));
+          return;
+        }
         if (fromId === AGENT_IDENTITY) return;
 
         var text = Buffer.from(raw).toString('utf8');
-        console.log('[data] from=' + fromId + ' len=' + text.length);
+        console.log('[data] userPacket from=' + fromId + ' len=' + text.length);
         try { processData(JSON.parse(text), fromId); }
+        catch (e) { console.error('[data] parse: ' + e.message); }
+      }
+
+      // dataChannelMessage — старый путь (lossy через сигнальный WS)
+      if (msgCase === 'dataChannelMessage') {
+        var dc  = sig.message.value;
+        var raw2 = dc.payload || dc.data;
+        if (!raw2) return;
+        var fromId2 = dc.participantSid || dc.participantIdentity || 'unknown';
+        if (fromId2 === AGENT_IDENTITY) return;
+
+        var text2 = Buffer.from(raw2).toString('utf8');
+        console.log('[data] dataChannel from=' + fromId2 + ' len=' + text2.length);
+        try { processData(JSON.parse(text2), fromId2); }
         catch (e) { console.error('[data] parse: ' + e.message); }
       }
 
@@ -264,4 +288,3 @@ server.listen(PORT, function () {
   console.log('');
   connectSignal();
 });
-
