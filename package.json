@@ -1,6 +1,7 @@
 {
   "name": "railway-relay-agent",
-  "version": "2.0.0",
+  "version": "3.0.0",
+  "description": "LiveKit agent — pure JS, без нативных deps (@livekit/rtc-node убран)",
   "scripts": {
     "start": "node server.js"
   },
@@ -8,7 +9,7 @@
     "node": ">=18"
   },
   "dependencies": {
-    "@livekit/rtc-node": "^0.13.31",
+    "livekit-client": "^2.20.1",
     "livekit-server-sdk": "^2.9.0",
     "ws": "^8.18.0"
   }
