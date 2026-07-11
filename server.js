@@ -36,9 +36,9 @@ async function sendResponse(toIdentity, data) {
   }
 }
 
-// Обработка данных
+// Обработка данных от букмарклета
 function processData(msg, fromIdentity) {
-  console.log(`[INCOMING] from=${fromIdentity} action=${msg.action || 'unknown'}`);
+  console.log(`[INCOMING] from=${fromIdentity} action=${msg.action || 'unknown'}`, msg);
 
   if (msg.action === 'data' || msg.action === 'hello') {
     const text = msg.text || msg.message || 'привет';
@@ -62,7 +62,7 @@ async function connectSignal() {
   const token = await at.toJwt();
   const url = `${LK_URL}/rtc?access_token=${token}&protocol=15&sdk=js&auto_subscribe=1`;
 
-  console.log('[SIGNAL] Connecting...');
+  console.log('[SIGNAL] Connecting to', LK_URL);
 
   const ws = new WS(url);
   signalWs = ws;
@@ -89,10 +89,14 @@ async function connectSignal() {
           try {
             const text = Buffer.from(payload).toString('utf8');
             processData(JSON.parse(text), from);
-          } catch (e) {}
+          } catch (e) {
+            console.error('[PARSE ERROR]', e.message);
+          }
         }
       }
-    } catch (e) {}
+    } catch (e) {
+      console.error('[SIGNAL MSG ERROR]', e.message);
+    }
   });
 
   ws.on('close', () => {
@@ -105,10 +109,13 @@ async function connectSignal() {
   ws.on('error', (e) => console.error('[SIGNAL] Error:', e.message));
 }
 
-// HTTP сервер
+// ==================== HTTP ====================
 const server = http.createServer((req, res) => {
+  console.log(`[HTTP ${req.method}] ${req.url}`);
+
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Access-Control-Allow-Methods', 'GET,POST,OPTIONS');
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
 
   if (req.method === 'OPTIONS') {
     res.writeHead(204);
@@ -116,32 +123,42 @@ const server = http.createServer((req, res) => {
     return;
   }
 
+  // Health check
   if (req.url === '/health' || req.url === '/') {
     res.writeHead(200, {'Content-Type': 'application/json'});
     res.end(JSON.stringify({ok: true, connected: isConnected, room: ROOM_NAME}));
     return;
   }
 
+  // Webhook для LiveKit
   if (req.url === '/webhook') {
     let body = '';
-    req.on('data', chunk => body += chunk);
+    req.on('data', chunk => { body += chunk; });
     req.on('end', () => {
+      console.log('[WEBHOOK] Получен запрос! Размер body:', body.length);
+      console.log('[WEBHOOK] Headers:', JSON.stringify(req.headers, null, 2));
+
       try {
-        const data = JSON.parse(body);
-        console.log('[WEBHOOK] Event:', data.event || 'unknown');
-      } catch (e) {}
+        const event = JSON.parse(body);
+        console.log('[WEBHOOK] Event type:', event.event || event.type || 'unknown');
+        console.dir(event, {depth: 2});
+      } catch (e) {
+        console.log('[WEBHOOK] Не JSON body:', body.substring(0, 300));
+      }
+
       res.writeHead(200, {'Content-Type': 'application/json'});
       res.end(JSON.stringify({ok: true}));
     });
     return;
   }
 
+  // 404
   res.writeHead(404);
   res.end('Not found');
 });
 
 server.listen(PORT, () => {
-  console.log(`\n=== Railway LiveKit Agent v4 (hardcoded) ===`);
+  console.log(`\n=== Railway LiveKit Agent v5 (улучшенный webhook) ===`);
   console.log(`Port: ${PORT} | Room: ${ROOM_NAME}`);
   connectSignal();
 });
