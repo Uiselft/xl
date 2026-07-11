@@ -36,7 +36,7 @@ async function sendResponse(toIdentity, data) {
   }
 }
 
-// Обработка данных от клиента
+// Обработка данных
 function processData(msg, fromIdentity) {
   console.log(`[INCOMING] from=${fromIdentity} action=${msg.action || 'unknown'}`);
 
@@ -62,7 +62,7 @@ async function connectSignal() {
   const token = await at.toJwt();
   const url = `${LK_URL}/rtc?access_token=${token}&protocol=15&sdk=js&auto_subscribe=1`;
 
-  console.log('[SIGNAL] Connecting to', LK_URL);
+  console.log('[SIGNAL] Connecting...');
 
   const ws = new WS(url);
   signalWs = ws;
@@ -77,7 +77,7 @@ async function connectSignal() {
 
       if (caseName === 'join') {
         isConnected = true;
-        console.log('[SIGNAL] ✅ JOINED ROOM SUCCESSFULLY');
+        console.log('[SIGNAL] ✅ JOINED ROOM');
       }
 
       if (caseName === 'userPacket' || caseName === 'dataChannelMessage') {
@@ -105,20 +105,43 @@ async function connectSignal() {
   ws.on('error', (e) => console.error('[SIGNAL] Error:', e.message));
 }
 
-// HTTP
+// HTTP сервер
 const server = http.createServer((req, res) => {
   res.setHeader('Access-Control-Allow-Origin', '*');
-  if (req.url === '/health') {
+  res.setHeader('Access-Control-Allow-Methods', 'GET,POST,OPTIONS');
+
+  if (req.method === 'OPTIONS') {
+    res.writeHead(204);
+    res.end();
+    return;
+  }
+
+  if (req.url === '/health' || req.url === '/') {
     res.writeHead(200, {'Content-Type': 'application/json'});
     res.end(JSON.stringify({ok: true, connected: isConnected, room: ROOM_NAME}));
     return;
   }
+
+  if (req.url === '/webhook') {
+    let body = '';
+    req.on('data', chunk => body += chunk);
+    req.on('end', () => {
+      try {
+        const data = JSON.parse(body);
+        console.log('[WEBHOOK] Event:', data.event || 'unknown');
+      } catch (e) {}
+      res.writeHead(200, {'Content-Type': 'application/json'});
+      res.end(JSON.stringify({ok: true}));
+    });
+    return;
+  }
+
   res.writeHead(404);
-  res.end();
+  res.end('Not found');
 });
 
 server.listen(PORT, () => {
-  console.log(`\n=== Railway LiveKit Agent v4 (hardcoded keys) ===`);
-  console.log(`Room: ${ROOM_NAME}`);
+  console.log(`\n=== Railway LiveKit Agent v4 (hardcoded) ===`);
+  console.log(`Port: ${PORT} | Room: ${ROOM_NAME}`);
   connectSignal();
 });
