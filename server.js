@@ -1,142 +1,60 @@
 'use strict';
 
 /**
- * Railway LiveKit Agent Server v3
- *
- * СТЕК: livekit-client (pure JS) + ws полифил — БЕЗ нативных deps
- * Убран @livekit/rtc-node (Rust bindings, ломался на Railway при install)
+ * Railway LiveKit Agent v4 — PURE WebSocket, NO WebRTC
  *
  * АРХИТЕКТУРА:
- *   Букмарклет → publishData() → wss://*.livekit.cloud
- *                                        ↓
- *   Railway подключается к той же комнате через livekit-client + ws
- *   RoomEvent.DataReceived → processData() → roomService.sendData()
- *                                        ↓
- *   Букмарклет → RoomEvent.DataReceived → alert()
+ *   Букмарклет → publishData({reliable:true}) → wss://*.livekit.cloud
+ *                                                      ↓
+ *   Railway подключается к той же комнате через ЧИСТЫЙ WebSocket
+ *   (LiveKit Signaling Protocol, @livekit/protocol protobuf-es)
+ *   SignalResponse.fromBinary() → DataPacket → processData()
+ *   Ответ: roomService.sendData() → REST API → букмарклет
  *
- * ПОЧЕМУ НЕ ВЕБХУКИ:
- *   LiveKit webhooks не доставляют publishData().
- *   data_packet_received не существует в LiveKit webhook API.
+ * ПОЧЕМУ НЕ WEBRTC:
+ *   Нет @roamhq/wrtc нативных deps, нет NO_SOCKET, нет navigator is not defined.
+ *   Только ws + protobuf-es.
  */
 
-// ─── Browser API полифилы — ОБЯЗАТЕЛЬНО до require('livekit-client') ─────────
-// livekit-client читает navigator/window/document при инициализации модуля
+var http  = require('http');
+var WS    = require('ws');
+var proto = require('@livekit/protocol');
+var { AccessToken, RoomServiceClient, DataPacket_Kind } = require('livekit-server-sdk');
 
-var WS = require('ws');
-
-// WebSocket полифил
-global.WebSocket = WS;
-
-// navigator полифил (livekit-client проверяет navigator.userAgent и др.)
-if (typeof global.navigator === 'undefined') {
-  global.navigator = {
-    userAgent: 'Mozilla/5.0 (Node.js) railway-agent',
-    language: 'en',
-    languages: ['en'],
-    onLine: true,
-    mediaDevices: undefined,
-    permissions: undefined,
-    hardwareConcurrency: 1,
-    maxTouchPoints: 0,
-    vendor: '',
-    platform: 'Node',
-  };
-}
-
-// window полифил
-if (typeof global.window === 'undefined') {
-  global.window = {
-    navigator: global.navigator,
-    location:  { href: 'http://localhost/', hostname: 'localhost', origin: 'http://localhost', protocol: 'http:' },
-    addEventListener:    function () {},
-    removeEventListener: function () {},
-    dispatchEvent:       function () {},
-    setTimeout:  global.setTimeout,
-    clearTimeout: global.clearTimeout,
-    setInterval:  global.setInterval,
-    clearInterval: global.clearInterval,
-    crypto: global.crypto,
-    performance: global.performance,
-  };
-}
-
-// document полифил (livekit-client может читать document.hidden и др.)
-if (typeof global.document === 'undefined') {
-  global.document = {
-    hidden: false,
-    visibilityState: 'visible',
-    addEventListener: function () {},
-    removeEventListener: function () {},
-    createElement: function () { return {}; },
-    head: { appendChild: function () {} },
-    body: { appendChild: function () {} },
-    querySelectorAll: function () { return []; },
-  };
-}
-
-// WebRTC полифил через @roamhq/wrtc — даёт настоящий RTCPeerConnection в Node.js
-// Без него livekit-client падает с "LiveKit doesn't seem to be supported on this browser"
-var wrtc = require('@roamhq/wrtc');
-global.RTCPeerConnection        = wrtc.RTCPeerConnection;
-global.RTCSessionDescription    = wrtc.RTCSessionDescription;
-global.RTCIceCandidate          = wrtc.RTCIceCandidate;
-global.MediaStream              = wrtc.MediaStream;
-global.MediaStreamTrack         = wrtc.MediaStreamTrack;
-global.RTCDataChannel           = wrtc.RTCDataChannel;
-
-// HTMLMediaElement заглушка (нужна livekit-client, медиа нам не нужно)
-if (typeof global.HTMLMediaElement === 'undefined') {
-  global.HTMLMediaElement = function () {};
-}
-
-// livekit-client v2 — UMD build через require()
-var LC = require('livekit-client');
-
-var http    = require('http');
-var { RoomServiceClient, DataPacket_Kind, AccessToken } = require('livekit-server-sdk');
-
-var PORT           = process.env.PORT                || 8080;
-var LK_API_KEY     = process.env.LIVEKIT_API_KEY     || 'APIAsfxvEYsPGA2';
-var LK_API_SECRET  = process.env.LIVEKIT_API_SECRET  || 'JCHcXc1lYger14JRo6IRih7pJRg8UyoUayGuHMmEKoK';
-var LK_WS_URL      = process.env.LIVEKIT_URL         || 'wss://jack-6u9u95rm.livekit.cloud';
+var PORT           = process.env.PORT               || 8080;
+var LK_API_KEY     = process.env.LIVEKIT_API_KEY    || 'APIAsfxvEYsPGA2';
+var LK_API_SECRET  = process.env.LIVEKIT_API_SECRET || 'JCHcXc1lYger14JRo6IRih7pJRg8UyoUayGuHMmEKoK';
+var LK_WS_URL      = process.env.LIVEKIT_URL        || 'wss://jack-6u9u95rm.livekit.cloud';
 var LK_HTTP_URL    = LK_WS_URL.replace(/^wss?:\/\//, 'https://');
 var ROOM_NAME      = 'bookmark-room';
-var AGENT_IDENTITY = 'railway-agent-' + Date.now();
+var AGENT_IDENTITY = 'railway-agent';
 
-// ─── RoomServiceClient — отправляет ответ обратно в комнату ──────────────────
+// ─── RoomServiceClient — отправляет ответ обратно через REST API ──────────────
 var roomService = new RoomServiceClient(LK_HTTP_URL, LK_API_KEY, LK_API_SECRET);
 
-function sendDataToRoom(data) {
+function sendDataToRoom(data, toIdentities) {
   var bytes = new TextEncoder().encode(JSON.stringify(data));
-  console.log('[sendData] action=' + data.action + ' bytes=' + bytes.length);
+  var opts  = { destinationIdentities: toIdentities || [] };
   return roomService
-    .sendData(ROOM_NAME, bytes, DataPacket_Kind.RELIABLE)
-    .then(function () {
-      console.log('[sendData] OK — ответ отправлен букмарклету');
-    })
-    .catch(function (e) {
-      console.error('[sendData] ERROR: ' + e.message);
-    });
+    .sendData(ROOM_NAME, bytes, DataPacket_Kind.RELIABLE, opts)
+    .then(function () { console.log('[sendData] OK  action=' + data.action); })
+    .catch(function (e) { console.error('[sendData] ERR ' + e.message); });
 }
 
-// ─── Обработка сообщения от букмарклета ─────────────────────────────────────
-function processData(msg) {
+// ─── Обработка данных от букмарклета ────────────────────────────────────────
+function processData(msg, fromIdentity) {
   var action  = msg.action  || 'unknown';
   var payload = msg.payload || {};
-  console.log('[relay] action=' + action + ' url=' + (payload.url || '?'));
+  console.log('[relay] from=' + fromIdentity + ' action=' + action);
 
   if (action === 'data') {
-    console.log('[data] URL:    ' + payload.url);
-    console.log('[data] Title:  ' + payload.title);
-    console.log('[data] Cookie: ' + (payload.cookie || '').substring(0, 120));
+    console.log('[data] url='   + payload.url);
+    console.log('[data] title=' + payload.title);
     sendDataToRoom({
-      action: 'ack',
-      ok: true,
-      message: 'Railway received! (livekit-client agent)',
-      url: payload.url,
-      title: payload.title,
-      ts: Date.now(),
-    });
+      action: 'ack', ok: true,
+      message: 'Railway получил данные!',
+      url: payload.url, title: payload.title, ts: Date.now(),
+    }, [fromIdentity]);
 
   } else if (action === 'fetch') {
     var url = payload.url || msg.url || '';
@@ -149,115 +67,145 @@ function processData(msg) {
     })
       .then(function (r) {
         return r.text().then(function (t) {
-          var d;
-          try { d = JSON.parse(t); } catch (e) { d = t.substring(0, 4000); }
-          sendDataToRoom({ action: 'fetch_result', ok: true, status: r.status, data: d, ts: Date.now() });
+          var d; try { d = JSON.parse(t); } catch (e) { d = t.substring(0, 4000); }
+          sendDataToRoom({ action: 'fetch_result', ok: true, status: r.status, data: d, ts: Date.now() }, [fromIdentity]);
         });
       })
       .catch(function (e) {
-        sendDataToRoom({ action: 'fetch_result', ok: false, error: e.message, ts: Date.now() });
+        sendDataToRoom({ action: 'fetch_result', ok: false, error: e.message, ts: Date.now() }, [fromIdentity]);
       });
 
   } else {
-    console.log('[relay] unknown action: ' + action);
-    sendDataToRoom({ action: 'ack', ok: true, message: 'unknown action: ' + action });
+    sendDataToRoom({ action: 'ack', ok: true, echo: action }, [fromIdentity]);
   }
 }
 
-// ─── LiveKit Agent — подключается к комнате через livekit-client ─────────────
-var agentRoom     = null;
-var isConnecting  = false;
-var reconnectTimer = null;
-
-async function connectAgent() {
-  if (isConnecting) return;
-  isConnecting = true;
-
+// ─── Парсим DataPacket из бинарного буфера (protobuf-es fromBinary) ─────────
+function tryParseDataPacket(buf) {
   try {
-    // Генерируем JWT токен для агента
-    var at = new AccessToken(LK_API_KEY, LK_API_SECRET, {
-      identity: AGENT_IDENTITY,
-      ttl: '24h',
-    });
-    at.addGrant({
-      room: ROOM_NAME,
-      roomJoin: true,
-      canPublish: false,
-      canPublishData: true,
-      canSubscribe: true,
-    });
-    var token = await at.toJwt();
-
-    // Создаём Room через livekit-client (pure JS)
-    // iceTransportPolicy: 'relay' — форсируем TURN relay чтобы обойти
-    // NO_SOCKET ошибку Railway: прямые P2P UDP/TCP коннекты блокируются файрволлом,
-    // весь WebRTC трафик должен идти через LiveKit TURN серверы по TCP/443
-    var room = new LC.Room({
-      adaptiveStream: false,
-      dynacast: false,
-      stopLocalTrackOnUnpublish: false,
-      rtcConfig: {
-        iceTransportPolicy: 'relay',
-      },
-    });
-    agentRoom = room;
-
-    // Слушаем входящие данные
-    room.on(LC.RoomEvent.DataReceived, function (rawData, participant, kind, topic) {
-      var fromId = (participant && participant.identity) ? participant.identity : 'server';
-
-      // Игнорируем данные от самого агента
-      if (fromId === AGENT_IDENTITY || fromId.startsWith('railway-agent-')) return;
-
-      console.log('[agent] DataReceived from=' + fromId + ' bytes=' + rawData.byteLength + ' topic=' + (topic || '-'));
-
-      try {
-        var str = new TextDecoder().decode(rawData);
-        console.log('[agent] raw: ' + str.substring(0, 300));
-        var msg = JSON.parse(str);
-        processData(msg);
-      } catch (e) {
-        console.error('[agent] parse error: ' + e.message);
-        sendDataToRoom({ action: 'error', error: 'parse error: ' + e.message });
-      }
-    });
-
-    room.on(LC.RoomEvent.ParticipantConnected, function (p) {
-      console.log('[agent] Participant joined: ' + p.identity);
-    });
-
-    room.on(LC.RoomEvent.ParticipantDisconnected, function (p) {
-      console.log('[agent] Participant left: ' + p.identity);
-    });
-
-    room.on(LC.RoomEvent.Disconnected, function (reason) {
-      console.log('[agent] Disconnected, reason=' + reason + '. Reconnect in 5s...');
-      agentRoom   = null;
-      isConnecting = false;
-      if (reconnectTimer) clearTimeout(reconnectTimer);
-      reconnectTimer = setTimeout(connectAgent, 5000);
-    });
-
-    room.on(LC.RoomEvent.ConnectionStateChanged, function (state) {
-      console.log('[agent] ConnectionState: ' + state);
-    });
-
-    room.on(LC.RoomEvent.ConnectionQualityChanged, function (quality, participant) {
-      // тихо — слишком шумный ивент
-    });
-
-    console.log('[agent] Connecting to: ' + LK_WS_URL + ' room=' + ROOM_NAME);
-    await room.connect(LK_WS_URL, token, { autoSubscribe: true });
-
-    console.log('[agent] ✓ Connected! Waiting for data from bookmarklets...');
-    isConnecting = false;
-
+    var sig = proto.SignalResponse.fromBinary(buf);
+    // DataPacket приходит как sig.dataChannelMessage или напрямую
+    if (sig.message && sig.message.case === 'dataChannelMessage') {
+      return sig.message.value;
+    }
+    // Попробуем напрямую как DataPacket
+    var dp = proto.DataPacket.fromBinary(buf);
+    return dp;
   } catch (e) {
-    console.error('[agent] Connection failed: ' + e.message);
-    isConnecting = false;
-    if (reconnectTimer) clearTimeout(reconnectTimer);
-    reconnectTimer = setTimeout(connectAgent, 5000);
+    return null;
   }
+}
+
+// ─── LiveKit Signaling WebSocket Client ──────────────────────────────────────
+var signalWs       = null;
+var pingInterval   = null;
+var reconnectTimer = null;
+var agentConnected = false;
+
+async function connectSignal() {
+  if (signalWs) return;
+
+  var at = new AccessToken(LK_API_KEY, LK_API_SECRET, {
+    identity: AGENT_IDENTITY,
+    ttl: '24h',
+  });
+  at.addGrant({
+    room: ROOM_NAME, roomJoin: true,
+    canPublish: false, canPublishData: true, canSubscribe: true,
+  });
+  var token = await at.toJwt();
+
+  // protocol=15, adaptive_stream=1 — нужно для DataPacket через signal WS
+  var url = LK_WS_URL + '/rtc'
+    + '?access_token=' + token
+    + '&protocol=15'
+    + '&sdk=js'
+    + '&version=2.0.0'
+    + '&os=linux'
+    + '&auto_subscribe=1'
+    + '&adaptive_stream=1';
+
+  console.log('[signal] Connecting: ' + LK_WS_URL + ' room=' + ROOM_NAME);
+
+  var ws = new WS(url);
+  signalWs = ws;
+
+  ws.on('open', function () {
+    console.log('[signal] WS open');
+  });
+
+  ws.on('message', function (rawData, isBinary) {
+    // LiveKit v1.x шлёт бинарные фреймы protobuf-es
+    try {
+      var buf = Buffer.isBuffer(rawData) ? rawData : Buffer.from(rawData);
+
+      if (!isBinary) {
+        // Текстовый фрейм — LiveKit иногда шлёт base64 или строки
+        var str = buf.toString('utf8');
+        // Попробуем всё равно как protobuf (часто это бинарные данные в text frame)
+        try {
+          buf = Buffer.from(str, 'binary');
+        } catch (_) { return; }
+      }
+
+      var sig = proto.SignalResponse.fromBinary(new Uint8Array(buf));
+      var msgCase = sig.message && sig.message.case;
+
+      if (msgCase === 'join') {
+        agentConnected = true;
+        var join = sig.message.value;
+        console.log('[signal] Joined room! server=' + (join.serverVersion || '?'));
+        console.log('[agent] Connected! Waiting for data from bookmarklets...');
+
+        // Пинг каждые 10 сек
+        if (pingInterval) clearInterval(pingInterval);
+        pingInterval = setInterval(function () {
+          if (ws.readyState !== WS.OPEN) return;
+          try {
+            // Минимальный Ping: поле 1 (timestamp) = varint 0
+            // Protobuf: field_number=1 wire_type=0 -> tag=0x08, value=0x00
+            ws.send(Buffer.from([0x08, 0x00]));
+          } catch (e) { /* тихо */ }
+        }, 10000);
+      }
+
+      if (msgCase === 'dataChannelMessage') {
+        // DataPacket от другого участника (reliable через SCTP signaling)
+        var dc  = sig.message.value;
+        var raw = dc.payload || dc.data;
+        if (!raw) return;
+        var fromId = dc.participantSid || dc.participantIdentity || 'unknown';
+        if (fromId === AGENT_IDENTITY) return;
+
+        var text = Buffer.from(raw).toString('utf8');
+        console.log('[data] from=' + fromId + ' len=' + text.length);
+        try { processData(JSON.parse(text), fromId); }
+        catch (e) { console.error('[data] parse: ' + e.message); }
+      }
+
+    } catch (e) {
+      // Тихо игнорируем фреймы которые не парсятся (ICE candidates и т.д.)
+    }
+  });
+
+  ws.on('close', function (code, reason) {
+    console.log('[signal] Closed ' + code + '. Reconnect in 5s...');
+    agentConnected = false;
+    signalWs = null;
+    if (pingInterval) { clearInterval(pingInterval); pingInterval = null; }
+    if (reconnectTimer) clearTimeout(reconnectTimer);
+    reconnectTimer = setTimeout(connectSignal, 5000);
+  });
+
+  ws.on('error', function (e) {
+    console.error('[signal] Error: ' + e.message);
+    agentConnected = false;
+    signalWs = null;
+    if (pingInterval) { clearInterval(pingInterval); pingInterval = null; }
+    try { ws.terminate(); } catch (_) {}
+    if (reconnectTimer) clearTimeout(reconnectTimer);
+    reconnectTimer = setTimeout(connectSignal, 5000);
+  });
 }
 
 // ─── HTTP server ─────────────────────────────────────────────────────────────
@@ -265,35 +213,27 @@ var server = http.createServer(function (req, res) {
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Access-Control-Allow-Methods', 'GET,POST,OPTIONS');
   res.setHeader('Access-Control-Allow-Headers', 'Content-Type,Authorization');
-
   if (req.method === 'OPTIONS') { res.writeHead(204); res.end(); return; }
 
-  // GET / — health check
-  if (req.method === 'GET' && req.url === '/') {
+  if (req.method === 'GET' && (req.url === '/' || req.url === '/health')) {
     res.writeHead(200, { 'content-type': 'application/json' });
     res.end(JSON.stringify({
-      ok: true,
-      service: 'railway-livekit-agent-v3',
-      room: ROOM_NAME,
-      agentIdentity: AGENT_IDENTITY,
-      agentConnected: agentRoom !== null && agentRoom.state === LC.ConnectionState.Connected,
-      roomState: agentRoom ? agentRoom.state : 'disconnected',
+      ok: true, service: 'railway-livekit-agent-v4-pure-ws',
+      room: ROOM_NAME, agentConnected: agentConnected,
+      wsState: signalWs ? signalWs.readyState : -1,
       ts: Date.now(),
     }));
     return;
   }
 
-  // POST /relay — прямой HTTP relay (отладка / fallback)
   if (req.method === 'POST' && req.url === '/relay') {
     var body = '';
-    req.on('data', function (chunk) { body += chunk.toString(); });
+    req.on('data', function (c) { body += c.toString(); });
     req.on('end', function () {
       try {
-        var msg = JSON.parse(body);
-        console.log('[relay-http] action=' + (msg.action || '?'));
-        processData(msg);
+        processData(JSON.parse(body), 'http-relay');
         res.writeHead(200, { 'content-type': 'application/json' });
-        res.end(JSON.stringify({ ok: true, message: 'received via HTTP relay' }));
+        res.end(JSON.stringify({ ok: true }));
       } catch (e) {
         res.writeHead(400, { 'content-type': 'application/json' });
         res.end(JSON.stringify({ ok: false, error: e.message }));
@@ -302,19 +242,13 @@ var server = http.createServer(function (req, res) {
     return;
   }
 
-  // POST /webhook — оставлен для совместимости, только логирует
   if (req.method === 'POST' && req.url === '/webhook') {
-    var body2 = '';
-    req.on('data', function (chunk) { body2 += chunk.toString(); });
+    var b2 = '';
+    req.on('data', function (c) { b2 += c.toString(); });
     req.on('end', function () {
-      try {
-        var parsed = JSON.parse(body2);
-        console.log('[webhook] event=' + (parsed.event || '?') + ' (data_packet_received не существует в LK webhooks)');
-      } catch (e) {
-        console.log('[webhook] raw: ' + body2.substring(0, 100));
-      }
+      try { var p2 = JSON.parse(b2); console.log('[webhook] event=' + (p2.event || '?')); } catch (_) {}
       res.writeHead(200, { 'content-type': 'application/json' });
-      res.end(JSON.stringify({ ok: true, note: 'webhooks не доставляют publishData — используем RTC agent' }));
+      res.end(JSON.stringify({ ok: true }));
     });
     return;
   }
@@ -324,11 +258,10 @@ var server = http.createServer(function (req, res) {
 
 server.listen(PORT, function () {
   console.log('');
-  console.log('[server] Railway LiveKit Agent v3 started on port ' + PORT);
-  console.log('[server] Stack: livekit-client (pure JS) + ws polyfill');
-  console.log('[server] No native deps — @livekit/rtc-node removed');
-  console.log('[server] Room: ' + ROOM_NAME + ' at ' + LK_WS_URL);
+  console.log('[server] Railway LiveKit Agent v4 — Pure WebSocket + protobuf-es');
+  console.log('[server] NO WebRTC  |  NO native deps  |  ws + @livekit/protocol');
+  console.log('[server] Room: ' + ROOM_NAME + ' @ ' + LK_WS_URL);
   console.log('');
-  connectAgent();
+  connectSignal();
 });
 
