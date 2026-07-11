@@ -170,10 +170,46 @@ function connectToLiveKit() {
   });
 }
 
-// ─── HTTP server (health check only) ────────────────────────────────────────
+// ─── HTTP server ────────────────────────────────────────────────────────────
 var server = http.createServer(function(req, res) {
   res.setHeader('Access-Control-Allow-Origin','*');
+  res.setHeader('Access-Control-Allow-Methods','GET,POST,OPTIONS');
+  res.setHeader('Access-Control-Allow-Headers','Content-Type,Authorization');
+  
   if (req.method === 'OPTIONS') { res.writeHead(204); res.end(); return; }
+
+  // POST /webhook — получить данные от букмарклета и отправить ответ напрямую
+  if (req.method === 'POST' && req.url === '/webhook') {
+    var body = '';
+    req.on('data', function(chunk) { body += chunk.toString(); });
+    req.on('end', function() {
+      try {
+        var msg = JSON.parse(body);
+        console.log('[webhook] received from bookmarklet');
+        processData(msg);
+        
+        // СРАЗУ отправляем ответ букмарклету (не через LiveKit)
+        var responseData = msg.payload || {};
+        res.writeHead(200, {'content-type':'application/json'});
+        res.end(JSON.stringify({
+          ok: true,
+          message: 'Railway webhook received',
+          received: {
+            url: responseData.url,
+            title: responseData.title
+          },
+          ts: Date.now()
+        }));
+      } catch(e) {
+        console.error('[webhook] parse error: '+e.message);
+        res.writeHead(400, {'content-type':'application/json'});
+        res.end(JSON.stringify({ok:false,error:e.message}));
+      }
+    });
+    return;
+  }
+
+  // GET / — health check
   res.writeHead(200, {'content-type':'application/json'});
   res.end(JSON.stringify({
     ok: true,
@@ -187,3 +223,4 @@ server.listen(PORT, function() {
   console.log('[server] Railway LiveKit receiver on port '+PORT);
   connectToLiveKit();
 });
+
