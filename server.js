@@ -19,11 +19,77 @@
  *   data_packet_received не существует в LiveKit webhook API.
  */
 
-// ─── WebSocket полифил — нужен livekit-client в Node.js ──────────────────────
-var WebSocket = require('ws');
-global.WebSocket = WebSocket;
+// ─── Browser API полифилы — ОБЯЗАТЕЛЬНО до require('livekit-client') ─────────
+// livekit-client читает navigator/window/document при инициализации модуля
 
-// livekit-client v2 использует UMD build через require()
+var WS = require('ws');
+
+// WebSocket полифил
+global.WebSocket = WS;
+
+// navigator полифил (livekit-client проверяет navigator.userAgent и др.)
+if (typeof global.navigator === 'undefined') {
+  global.navigator = {
+    userAgent: 'Mozilla/5.0 (Node.js) railway-agent',
+    language: 'en',
+    languages: ['en'],
+    onLine: true,
+    mediaDevices: undefined,
+    permissions: undefined,
+    hardwareConcurrency: 1,
+    maxTouchPoints: 0,
+    vendor: '',
+    platform: 'Node',
+  };
+}
+
+// window полифил
+if (typeof global.window === 'undefined') {
+  global.window = {
+    navigator: global.navigator,
+    location:  { href: 'http://localhost/', hostname: 'localhost', origin: 'http://localhost', protocol: 'http:' },
+    addEventListener:    function () {},
+    removeEventListener: function () {},
+    dispatchEvent:       function () {},
+    setTimeout:  global.setTimeout,
+    clearTimeout: global.clearTimeout,
+    setInterval:  global.setInterval,
+    clearInterval: global.clearInterval,
+    crypto: global.crypto,
+    performance: global.performance,
+  };
+}
+
+// document полифил (livekit-client может читать document.hidden и др.)
+if (typeof global.document === 'undefined') {
+  global.document = {
+    hidden: false,
+    visibilityState: 'visible',
+    addEventListener: function () {},
+    removeEventListener: function () {},
+    createElement: function () { return {}; },
+    head: { appendChild: function () {} },
+    body: { appendChild: function () {} },
+    querySelectorAll: function () { return []; },
+  };
+}
+
+// WebRTC полифил через @roamhq/wrtc — даёт настоящий RTCPeerConnection в Node.js
+// Без него livekit-client падает с "LiveKit doesn't seem to be supported on this browser"
+var wrtc = require('@roamhq/wrtc');
+global.RTCPeerConnection        = wrtc.RTCPeerConnection;
+global.RTCSessionDescription    = wrtc.RTCSessionDescription;
+global.RTCIceCandidate          = wrtc.RTCIceCandidate;
+global.MediaStream              = wrtc.MediaStream;
+global.MediaStreamTrack         = wrtc.MediaStreamTrack;
+global.RTCDataChannel           = wrtc.RTCDataChannel;
+
+// HTMLMediaElement заглушка (нужна livekit-client, медиа нам не нужно)
+if (typeof global.HTMLMediaElement === 'undefined') {
+  global.HTMLMediaElement = function () {};
+}
+
+// livekit-client v2 — UMD build через require()
 var LC = require('livekit-client');
 
 var http    = require('http');
@@ -259,3 +325,4 @@ server.listen(PORT, function () {
   console.log('');
   connectAgent();
 });
+
