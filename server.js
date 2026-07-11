@@ -189,10 +189,16 @@ async function connectAgent() {
     var token = await at.toJwt();
 
     // Создаём Room через livekit-client (pure JS)
+    // iceTransportPolicy: 'relay' — форсируем TURN relay чтобы обойти
+    // NO_SOCKET ошибку Railway: прямые P2P UDP/TCP коннекты блокируются файрволлом,
+    // весь WebRTC трафик должен идти через LiveKit TURN серверы по TCP/443
     var room = new LC.Room({
       adaptiveStream: false,
       dynacast: false,
       stopLocalTrackOnUnpublish: false,
+      rtcConfig: {
+        iceTransportPolicy: 'relay',
+      },
     });
     agentRoom = room;
 
