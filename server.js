@@ -40,7 +40,7 @@ var LK_WS_URL      = process.env.LIVEKIT_URL        || 'wss://jack-6u9u95rm.live
 var LK_HTTP_URL    = LK_WS_URL.replace(/^wss?:\/\//, 'https://');
 var ROOM_NAME      = process.env.LK_ROOM            || 'bookmark-room';
 var AGENT_IDENTITY = 'railway-agent-v6';
-var VERCEL_URL     = process.env.VERCEL_URL         || 'https://bridge-kappa-hazel.vercel.app';
+var VERCEL_URL     = process.env.VERCEL_URL         || 'https://unpack-flame.vercel.app';
 var AGENT_SECRET   = process.env.AGENT_SECRET       || 'lk-agent-secret-2024';
 
 // ─── RoomServiceClient — отправляет ответ через LiveKit REST API ─────────────
@@ -370,4 +370,6 @@ httpServer.listen(PORT, function () {
   console.log('');
   connectAgent();
 });
+
+
 
