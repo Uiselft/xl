@@ -1,7 +1,7 @@
 {
   "name": "railway-relay-agent",
-  "version": "6.0.0",
-  "description": "LiveKit agent — @livekit/rtc-node (WebRTC DataChannel, receives publishData from browser)",
+  "version": "7.0.0",
+  "description": "LiveKit agent v7 — REST-only, no WebRTC/WASM required. Receives data via LiveKit Webhook.",
   "scripts": {
     "start": "node server.js"
   },
@@ -9,7 +9,7 @@
     "node": ">=18"
   },
   "dependencies": {
-    "@livekit/rtc-node": "^0.13.31",
     "livekit-server-sdk": "^2.9.0"
   }
 }
+
