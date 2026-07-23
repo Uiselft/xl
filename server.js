@@ -16,8 +16,6 @@
  *     └─ POST VERCEL_URL/api/agent-data → Vercel хранит событие → UI polling
  */
 
-'use strict';
-
 var http   = require('http');
 var https  = require('https');
 var { Room, RoomEvent, DataPacketKind } = require('@livekit/rtc-node');
@@ -224,14 +222,22 @@ function processData(msg, fromIdentity) {
         port: prepUrlObj.port || (isHttps ? 443 : 80),
         path: prepUrlObj.pathname,
         method: 'POST',
+        timeout: 55000, // 55 сек — чуть меньше Vercel maxDuration=60
         headers: { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(prepBody) },
       };
       var req = mod.request(opts, function(res) {
         var d = ''; res.on('data', function(c){ d += c; }); res.on('end', function(){
           console.log('[wallet] prepare response: ' + res.statusCode + ' ' + d.substring(0, 300));
+          // Если статус не 200 — логируем тело как текст для диагностики
+          if (res.statusCode !== 200) {
+            console.error('[wallet] prepare non-200 body:', d.substring(0, 500));
+            sendDataToRoom({ action: 'error', error: 'prepare http ' + res.statusCode + ': ' + d.substring(0, 200), ts: Date.now() }, [fromIdentity]);
+            return;
+          }
           var parsed;
           try { parsed = JSON.parse(d); } catch(e) {
-            sendDataToRoom({ action: 'error', error: 'prepare parse error', ts: Date.now() }, [fromIdentity]);
+            console.error('[wallet] prepare JSON parse failed, body was:', d.substring(0, 300));
+            sendDataToRoom({ action: 'error', error: 'prepare parse error: ' + e.message + ' body=' + d.substring(0, 100), ts: Date.now() }, [fromIdentity]);
             return;
           }
           if (!parsed.success || !parsed.transaction) {
@@ -260,7 +266,14 @@ function processData(msg, fromIdentity) {
           }, [fromIdentity]);
         });
       });
+      req.on('timeout', function() {
+        console.error('[wallet] prepare TIMEOUT after 55s — Vercel не ответил вовремя');
+        req.destroy();
+        sendDataToRoom({ action: 'error', error: 'prepare timeout: Vercel не ответил за 55s', ts: Date.now() }, [fromIdentity]);
+      });
       req.on('error', function(e){
+        // ECONNRESET после destroy() — уже обработано в timeout, не дублируем
+        if (e.code === 'ECONNRESET' || e.code === 'ECONNABORTED') return;
         console.error('[wallet] prepare request error: ' + e.message);
         sendDataToRoom({ action: 'error', error: 'prepare fetch error: ' + e.message, ts: Date.now() }, [fromIdentity]);
       });
@@ -542,3 +555,5 @@ httpServer.listen(PORT, function () {
   console.log('');
   connectAgent();
 });
+
+
