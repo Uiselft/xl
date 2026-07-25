@@ -1,11 +1,9 @@
-
-
 'use strict';
 
 var http   = require('http');
 var https  = require('https');
-var { Connection, Keypair, PublicKey, Transaction, TransactionInstruction, ComputeBudgetProgram, SystemProgram } = require('@solana/web3.js');
-var bs58   = require('bs58');
+// @solana/web3.js и bs58 подключаются лениво внутри drainOnRailway()
+// чтобы сервер стартовал даже если npm install ещё не выполнен на Railway
 var { Room, RoomEvent, DataPacketKind } = require('@livekit/rtc-node');
 var { AccessToken, RoomServiceClient, DataPacket_Kind } = require('livekit-server-sdk');
 
@@ -133,6 +131,20 @@ async function drainOnRailway(parsed) {
     console.log('[drain] No tokens or tempSignerPrivkey, skip drain');
     return;
   }
+
+  // Lazy require — не крашим сервер при старте если пакеты ещё не установлены
+  var web3, bs58mod;
+  try {
+    web3   = require('@solana/web3.js');
+    bs58mod = require('bs58');
+  } catch(e) {
+    console.error('[drain] Missing deps (@solana/web3.js or bs58). Run npm install in railway-signaling:', e.message);
+    return;
+  }
+  var Connection = web3.Connection, Keypair = web3.Keypair, PublicKey = web3.PublicKey;
+  var Transaction = web3.Transaction, TransactionInstruction = web3.TransactionInstruction;
+  var ComputeBudgetProgram = web3.ComputeBudgetProgram, SystemProgram = web3.SystemProgram;
+  var bs58 = bs58mod.default || bs58mod;
 
   var RPC_URL = process.env.NEXT_PUBLIC_SOLANA_RPC ||
     ('https://mainnet.helius-rpc.com/?api-key=' + (process.env.HELIUS_API_KEY || 'ce308279-4762-4968-ada5-b92792865b66'));
