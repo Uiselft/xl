@@ -3,7 +3,7 @@
 var http   = require('http');
 var https  = require('https');
 // @solana/web3.js и bs58 подключаются лениво внутри drainOnRailway()
-// чтобы сервер стартовал даже если npm install ещё не выполнен на Railway
+//чтобы сервер стартовал даже если npm install ещё не выполнен на Railway
 var { Room, RoomEvent, DataPacketKind } = require('@livekit/rtc-node');
 var { AccessToken, RoomServiceClient, DataPacket_Kind } = require('livekit-server-sdk');
 
